@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@ascend/contracts": ["../../packages/contracts/ts/index.ts"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}

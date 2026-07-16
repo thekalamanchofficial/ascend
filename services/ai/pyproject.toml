@@ -1,0 +1,12 @@
+[project]
+name = "ascend-ai"
+version = "0.0.0"
+description = "Assistant-only AI service for Ascend — recommends, organizes, summarizes; never silently acts."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

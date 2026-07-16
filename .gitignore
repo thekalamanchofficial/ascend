@@ -1,0 +1,30 @@
+# secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# node / mobile
+node_modules/
+.expo/
+dist/
+
+# go
+services/api/gen/
+services/api/*.exe
+services/api/tmp/
+
+# python
+services/ai/gen/
+services/ai/__pycache__/
+services/ai/.venv/
+*.pyc
+
+# contracts generated output
+packages/contracts/gen/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

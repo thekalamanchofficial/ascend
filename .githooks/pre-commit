@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Local mirror of the CI mechanical constitution checks. Enable with:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+exec bash scripts/constitution/run-all.sh

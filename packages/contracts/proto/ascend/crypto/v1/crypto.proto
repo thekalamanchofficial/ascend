@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package ascend.crypto.v1;
+
+// Cryptography & Keys — end-to-end encryption primitives, user-owned key
+// generation and storage. Frozen from docs/capabilities/cryptography-and-keys.charter.md §3.
+//
+// Invariant carried into every message below (charter §3, §4): private key
+// material never crosses this boundary in plaintext. Consumers only ever
+// receive an opaque `private_key_handle` (backed by OS keychain / secure
+// enclave, or an encrypted local store as fallback) — never raw key bytes.
+// The one exception is `ExportKeyMaterial`, which is an explicit,
+// user-confirmed escape hatch for Article 9, not a routine path.
+//
+// IMPLEMENTATION LOCATION (charter §4, §6): every RPC below runs on-device,
+// in apps/mobile. There is no server-side handler for this service and
+// there must never be one — charter §4 requires the server to see only
+// public keys and ciphertext, never plaintext or private key material, so a
+// backend implementation of Encrypt/Decrypt/GenerateIdentityKeyMaterial
+// would itself be a constitutional violation (Art. 7, Art. 8), not just a
+// bad idea. This .proto exists to pin one typed interface shared across
+// Go/TS/Python codegen (so every consumer agrees on shapes), not to declare
+// a network service. Generated Go/Python bindings for CryptoService are
+// unused by design; only the message types and the TS bindings are load-bearing.
+
+service CryptoService {
+  // The single generation event for a root identity key pair. Deterministic:
+  // recovery_phrase is the seed, public_key/private_key_handle are derived
+  // from it, not a second independently-generated secret (charter §3).
+  rpc GenerateIdentityKeyMaterial(GenerateIdentityKeyMaterialRequest) returns (GenerateIdentityKeyMaterialResponse);
+
+  // Non-recovery-bearing key pairs (e.g. per-device session keys).
+  rpc GenerateKeyPair(GenerateKeyPairRequest) returns (GenerateKeyPairResponse);
+
+  rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+  rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+
+  // Session/channel key agreement. Implementation must provide forward
+  // secrecy and post-compromise security (charter §6) — construction choice
+  // (e.g. double ratchet) is left to the capability engineer.
+  rpc DeriveSharedSecret(DeriveSharedSecretRequest) returns (DeriveSharedSecretResponse);
+
+  // Encrypted local storage wrapper other capabilities use instead of
+  // hand-rolling their own at-rest encryption.
+  rpc SecureLocalStore(SecureLocalStoreRequest) returns (SecureLocalStoreResponse);
+  rpc SecureLocalRetrieve(SecureLocalRetrieveRequest) returns (SecureLocalRetrieveResponse);
+
+  // Re-derives identity private key material from the mnemonic on a new
+  // device. Pure offline computation — no server involvement, ever
+  // (charter §3, §6; docs/DECISION_LOG.md 2026-07-06 "Recovery mechanism").
+  rpc RestoreFromRecoveryPhrase(RestoreFromRecoveryPhraseRequest) returns (RestoreFromRecoveryPhraseResponse);
+
+  // Explicit, user-initiated export of key material in a portable,
+  // documented format (Art. 9). Requires deliberate confirmation.
+  rpc ExportKeyMaterial(ExportKeyMaterialRequest) returns (ExportKeyMaterialResponse);
+}
+
+// An opaque reference to key material held behind this capability's
+// boundary (OS keychain / secure enclave / encrypted local store). Never
+// contains raw key bytes.
+message KeyHandle {
+  string handle = 1;
+}
+
+message GenerateIdentityKeyMaterialRequest {}
+
+message GenerateIdentityKeyMaterialResponse {
+  bytes public_key = 1;
+  KeyHandle private_key_handle = 2;
+  // Shown to the user exactly once by the caller (Identity capability);
+  // never persisted or logged by this service (charter §6).
+  string recovery_phrase = 3;
+}
+
+message GenerateKeyPairRequest {
+  // Free-form label for what this key pair is for (e.g. "device-session"),
+  // used only for local bookkeeping — never transmitted or logged as
+  // sensitive data.
+  string purpose = 1;
+}
+
+message GenerateKeyPairResponse {
+  bytes public_key = 1;
+  KeyHandle private_key_handle = 2;
+}
+
+message EncryptRequest {
+  repeated bytes recipient_public_keys = 1;
+  bytes plaintext = 2;
+}
+
+message EncryptResponse {
+  bytes ciphertext = 1;
+}
+
+message DecryptRequest {
+  KeyHandle private_key_handle = 1;
+  bytes ciphertext = 2;
+}
+
+message DecryptResponse {
+  bytes plaintext = 1;
+}
+
+message DeriveSharedSecretRequest {
+  KeyHandle private_key_handle = 1;
+  bytes remote_public_key = 2;
+}
+
+message DeriveSharedSecretResponse {
+  KeyHandle shared_secret_handle = 1;
+}
+
+message SecureLocalStoreRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message SecureLocalStoreResponse {}
+
+message SecureLocalRetrieveRequest {
+  string key = 1;
+}
+
+message SecureLocalRetrieveResponse {
+  bytes value = 1;
+}
+
+message RestoreFromRecoveryPhraseRequest {
+  string recovery_phrase = 1;
+}
+
+message RestoreFromRecoveryPhraseResponse {
+  KeyHandle private_key_handle = 1;
+  bytes public_key = 2;
+}
+
+message ExportKeyMaterialRequest {
+  // Explicit confirmation token proving the user deliberately initiated
+  // this export (charter §3) — not routine use.
+  bool user_confirmation = 1;
+}
+
+message ExportKeyMaterialResponse {
+  // Portable, documented export format (Art. 9). Format is an
+  // implementation decision for the capability engineer; must be
+  // self-describing enough to be usable outside Ascend.
+  bytes export_blob = 1;
+  string format_version = 2;
+}

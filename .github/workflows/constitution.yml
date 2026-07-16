@@ -1,0 +1,40 @@
+name: Constitution
+
+# Mechanical enforcement of docs/CONSTITUTION.md, owned by the Constitution
+# Warden. Qualitative articles (7, 12, 13, 17) are gated by the guardian
+# subagents at charter time, not here — see docs/CONSTITUTION.md
+# §Enforcement and root CLAUDE.md §Workflow.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  mechanical-checks:
+    name: Mechanical constitution checks (Art. 2, 5, 8, 9, 10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run all mechanical constitution checks
+        run: bash scripts/constitution/run-all.sh
+
+  contracts-breaking-change:
+    name: Contracts breaking-change check (Art. 10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+
+      - name: Lint contracts
+        working-directory: packages/contracts
+        run: buf lint
+
+      - name: Check for breaking changes against main
+        if: github.event_name == 'pull_request'
+        working-directory: packages/contracts
+        run: buf breaking --against '.git#branch=main'
