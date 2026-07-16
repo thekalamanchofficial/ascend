@@ -64,6 +64,15 @@ In scope because device binding is a security-sensitive boundary, though the dee
 | Experience Guardian | ✅ pass | Zero-config identity/device creation sound; recommended (and now incorporated) an explicit experience-budget statement for the recovery flow. | 2026-07-06 |
 | Security Steward | ✅ pass (after amendment) | Initially vetoed on an underspecified recovery mechanism; resolved via `docs/DECISION_LOG.md` "Recovery mechanism: deterministic key derivation, no server escrow" entry. | 2026-07-06 |
 
+**Implementation merge gate (`services/api/internal/identity`):**
+
+| Guardian | Verdict | Notes | Date |
+|---|---|---|---|
+| Constitution Warden | ✅ pass | Found `DATA_MANIFEST.md` omitted the persisted/exported `created_at_unix` field — fixed same pass. | 2026-07-16 |
+| Security Steward | 🚫 blocked → ✅ pass (after fix) | Initial veto: `BindDevice`'s signed message had no freshness/anti-replay input, so a revoked device's original `authorization_proof` remained valid forever and could be replayed to silently resurrect it — worst on the recovery path, since the root key never rotates. Fixed with a monotonic per-identity epoch bound into the signed message and verified server-side only; re-reviewed and confirmed closed, including tracing that no caller-supplied field can influence the epoch checked against. | 2026-07-16 |
+
+Not wired into `services/api/main.go` — see `docs/CAPABILITY_REGISTRY.md` Notes for the standing gate pending a Session/Request Authentication capability.
+
 ## 9. Decision log references
 
-See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering.
+See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering, and the 2026-07-16 entries for implementation, the Security Steward veto, and its fix.

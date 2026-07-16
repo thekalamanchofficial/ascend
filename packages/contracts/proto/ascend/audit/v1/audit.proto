@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package ascend.audit.v1;
+
+// Audit / Explainability — the standard "why/when/by-what-rule" event
+// substrate every state-changing action in Ascend emits into (Art. 5).
+// Frozen from docs/capabilities/audit-explainability.charter.md §3.
+//
+// IMPLEMENTATION (charter §3, §7): lives in services/api/internal/audit
+// (Go) — this package name is load-bearing, not cosmetic:
+// scripts/constitution/check-modularity.sh already exempts
+// `internal/audit` as a shared, cross-capability-importable package (the
+// same way a logging library would be), and check-audit-events.sh
+// mechanically expects any `// ascend:mutates`-marked function to call
+// `audit.Emit(`. Other *backend* capabilities (Identity, Permissions,
+// Storage, File Objects) call this package's exported `Emit` function
+// in-process, directly — that direct import is the one deliberate,
+// documented exception to Article 10's no-cross-import rule, same as any
+// shared substrate. Capabilities that are NOT part of the services/api Go
+// binary — currently only Cryptography & Keys, which runs entirely
+// on-device in apps/mobile — cannot make that in-process call, and instead
+// need this service's Emit RPC reachable over the network. This dual
+// reachability (direct Go import for backend capabilities, network RPC for
+// mobile-implemented ones) is a real requirement on this capability's
+// engineer, not just a nice-to-have: Cryptography & Keys' `audit.ts` has a
+// documented placeholder (`logAuditEvent`) specifically waiting for this.
+//
+// `actor`/`subject` fields below are opaque identity-reference strings
+// (matching Identity's `identity_ref` format), never a concrete Identity
+// struct — resolved lazily, by calling Identity.ResolveIdentity separately,
+// only when Query/Explain actually needs a display-ready identity. This
+// package does not import identity.proto or permissions.proto
+// (docs/DECISION_LOG.md, 2026-07-06, "Foundation contracts composition").
+
+service AuditService {
+  // The single call every other capability's state-mutating operations
+  // use.
+  rpc Emit(EmitRequest) returns (EmitResponse);
+
+  // A subject's own audit trail, queryable by resource, time range, or
+  // action type. Visibility into another subject's trail is
+  // Permissions-gated, resolved lazily at call time (charter §3) — this
+  // package does not import permissions.proto; the capability's Go
+  // implementation calls Permissions' `CheckPermission` in-process the
+  // same way it calls its own Emit for other capabilities.
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Turns a raw event into a plain-language rationale.
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+
+  // A user's full audit trail, exportable (Art. 9).
+  rpc ExportAuditTrail(ExportAuditTrailRequest) returns (ExportAuditTrailResponse);
+}
+
+message ResourceRef {
+  string resource_type = 1;
+  string resource_id = 2;
+}
+
+message AuditEvent {
+  string event_id = 1;
+  string actor = 2;
+  string action = 3;
+  ResourceRef resource = 4;
+  string rule_reference = 5;
+  map<string, string> metadata = 6;
+  int64 occurred_at_unix = 7;
+}
+
+message EmitRequest {
+  string actor = 1;
+  string action = 2;
+  ResourceRef resource = 3;
+  string rule_reference = 4;
+  // Charter §4: metadata may describe *that* an action happened, never
+  // sensitive content — e.g. record that a file was decrypted and by
+  // whom, not the plaintext. Same discipline Cryptography & Keys already
+  // applies to its own placeholder calls into this service.
+  map<string, string> metadata = 5;
+}
+
+message EmitResponse {
+  string event_id = 1;
+}
+
+message QueryRequest {
+  string subject = 1;
+  string resource_type_filter = 2;
+  string resource_id_filter = 3;
+  string action_filter = 4;
+  int64 since_unix = 5;
+  int64 until_unix = 6;
+}
+
+message QueryResponse {
+  repeated AuditEvent events = 1;
+}
+
+message ExplainRequest {
+  string event_id = 1;
+}
+
+message ExplainResponse {
+  string human_readable_rationale = 1;
+}
+
+message ExportAuditTrailRequest {
+  string identity_ref = 1;
+}
+
+message ExportAuditTrailResponse {
+  bytes export_blob = 1;
+  string format_version = 2;
+}

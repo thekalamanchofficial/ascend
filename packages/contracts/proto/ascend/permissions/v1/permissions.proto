@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package ascend.permissions.v1;
+
+// Permissions — fine-grained, least-privilege access control every other
+// capability calls to decide who may do what to which resource. Frozen
+// from docs/capabilities/permissions.charter.md §3.
+//
+// Implementation lives in services/api/internal/permissions (Go). Every
+// cross-capability reference (`grantor`, `subject`) is an opaque identity
+// reference string, matching the format Identity's `identity_ref` issues,
+// resolved by calling Identity.ResolveIdentity separately when a
+// display-ready identity is actually needed — this package does not import
+// identity.proto or services/api/internal/identity (docs/DECISION_LOG.md,
+// 2026-07-06, "Foundation contracts composition: opaque references, no
+// live cycle").
+
+service PermissionsService {
+  // The single call every other capability uses to make an access-control
+  // decision — no capability implements its own parallel check.
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+  rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
+  rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
+
+  // Lets a capability register its default (least-privilege) policy shape
+  // for a resource type when it comes online. Any resource type without a
+  // registered default must fail closed (charter §6).
+  rpc DefinePolicy(DefinePolicyRequest) returns (DefinePolicyResponse);
+
+  rpc ListGrantsForResource(ListGrantsForResourceRequest) returns (ListGrantsForResourceResponse);
+  rpc ListGrantsForSubject(ListGrantsForSubjectRequest) returns (ListGrantsForSubjectResponse);
+
+  // A user's full grant/revoke history and current effective permissions
+  // (Art. 9).
+  rpc ExportPermissions(ExportPermissionsRequest) returns (ExportPermissionsResponse);
+}
+
+// Opaque reference to a resource (a file, a conversation, etc.) owned by
+// whichever capability defines that resource type. Permissions never
+// depends on the resource's concrete type — resource_type is a free-form
+// namespace string each owning capability defines (e.g. "file_object").
+message ResourceRef {
+  string resource_type = 1;
+  string resource_id = 2;
+}
+
+message Grant {
+  string grantor = 1;
+  string subject = 2;
+  string action = 3;
+  ResourceRef resource = 4;
+  string scope = 5;
+  int64 granted_at_unix = 6;
+}
+
+message CheckPermissionRequest {
+  // Must be the true acting subject, never a calling capability's own
+  // service identity (charter §6, "confused deputy" threat).
+  string subject = 1;
+  string action = 2;
+  ResourceRef resource = 3;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+}
+
+message GrantPermissionRequest {
+  string grantor = 1;
+  string subject = 2;
+  string action = 3;
+  ResourceRef resource = 4;
+  string scope = 5;
+}
+
+message GrantPermissionResponse {
+  Grant grant = 1;
+}
+
+message RevokePermissionRequest {
+  string grantor = 1;
+  string subject = 2;
+  string action = 3;
+  ResourceRef resource = 4;
+}
+
+message RevokePermissionResponse {}
+
+message DefinePolicyRequest {
+  string resource_type = 1;
+  // Rule-language format is an implementation decision for the capability
+  // engineer (charter §7) — encoded as an opaque string here so the
+  // contract doesn't foreclose that choice.
+  string default_rules = 2;
+}
+
+message DefinePolicyResponse {}
+
+message ListGrantsForResourceRequest {
+  ResourceRef resource = 1;
+}
+
+message ListGrantsForSubjectRequest {
+  string subject = 1;
+}
+
+message ListGrantsForResourceResponse {
+  repeated Grant grants = 1;
+}
+
+message ListGrantsForSubjectResponse {
+  repeated Grant grants = 1;
+}
+
+message ExportPermissionsRequest {
+  string identity_ref = 1;
+}
+
+message ExportPermissionsResponse {
+  bytes export_blob = 1;
+  string format_version = 2;
+}

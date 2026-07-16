@@ -54,6 +54,15 @@ In scope — Permissions is a security-sensitive surface by definition.
 | Experience Guardian | ✅ pass | Owner-private-by-default is a genuine excellent default; rule-based policy editor correctly quarantined from the default flow, flagged for its own future Experience Guardian pass when designed. | 2026-07-06 |
 | Security Steward | ✅ pass | No blocking findings — fail-closed default-policy handling and grant/revoke attributability are concrete and sound. | 2026-07-06 |
 
+**Implementation merge gate (`services/api/internal/permissions`):**
+
+| Guardian | Verdict | Notes | Date |
+|---|---|---|---|
+| Constitution Warden | ✅ pass (after fix) | Every `AuditEmitter.Emit` call site discarded its returned error — a real gap: an oversized `DefinePolicy` string would silently produce no audit record while still reporting success. Fixed to check/handle the error at every call site, matching Identity's established pattern. | 2026-07-16 |
+| Security Steward | ✅ pass | No blocking findings — grant-chain escalation rule (exact-action match, ranked scope, implicit first-grantor ownership) and fail-closed unregistered-resource-type handling both verified directly against adversarial tests, not just happy-path. | 2026-07-16 |
+
+Not wired into `services/api/main.go` — see `docs/CAPABILITY_REGISTRY.md` Notes for the standing gate pending a Session/Request Authentication capability.
+
 ## 9. Decision log references
 
-See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering.
+See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering, and the 2026-07-16 entries for implementation and the Constitution Warden fix.

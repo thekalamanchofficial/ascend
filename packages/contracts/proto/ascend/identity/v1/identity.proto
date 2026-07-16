@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package ascend.identity.v1;
+
+// Identity — user-owned identity and device/key binding, no silent
+// server-side identity authority. Frozen from
+// docs/capabilities/identity.charter.md §3.
+//
+// IMPLEMENTATION SPLIT (charter §3, §4): private key material is generated
+// and held entirely client-side by Cryptography & Keys (apps/mobile) —
+// this service never generates, sees, or stores private key material, only
+// public keys and the metadata needed to answer "who is this, what devices
+// do they have, when were they added." The server-side implementation of
+// this contract lives in services/api/internal/identity (Go).
+
+service IdentityService {
+  // Registers a new identity's public record. The caller has already
+  // generated a key pair client-side via Cryptography & Keys'
+  // GenerateIdentityKeyMaterial — this call never generates key material
+  // itself, only stores the public identity record and first device.
+  rpc CreateIdentity(CreateIdentityRequest) returns (CreateIdentityResponse);
+
+  // Links a new device to an existing identity. authorization_proof is
+  // either a signature from an already-bound device's private key, or a
+  // self-signed assertion derived from the recovery phrase (charter §3,
+  // §6). This service verifies what it can cryptographically but, per the
+  // charter, has no discretionary authority to reject a validly-signed
+  // recovery assertion — it relays and audit-logs, it does not gatekeep.
+  rpc BindDevice(BindDeviceRequest) returns (BindDeviceResponse);
+
+  rpc RevokeDevice(RevokeDeviceRequest) returns (RevokeDeviceResponse);
+
+  // Read-only lookup of the public-facing identity record, for use by
+  // other capabilities (e.g. Permissions' subject resolution). Callers
+  // reference identities by the opaque `identity_ref` string this service
+  // issues at CreateIdentity time — other capabilities never import this
+  // proto package to get a typed reference, per the opaque-reference /
+  // lazy-resolution pattern (docs/DECISION_LOG.md, 2026-07-06, "Foundation
+  // contracts composition").
+  rpc ResolveIdentity(ResolveIdentityRequest) returns (ResolveIdentityResponse);
+
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+
+  // Complete, user-readable export of the identity record and device list
+  // (Art. 9).
+  rpc ExportIdentity(ExportIdentityRequest) returns (ExportIdentityResponse);
+}
+
+message Device {
+  string device_id = 1;
+  string name = 2;
+  bytes public_key = 3;
+  int64 added_at_unix = 4;
+  int64 last_seen_unix = 5;
+}
+
+message PublicIdentity {
+  string identity_ref = 1;
+  string display_name = 2;
+  bytes public_key = 3;
+  int32 device_count = 4;
+  // Monotonically increasing device-topology version, advanced on every
+  // BindDevice/RevokeDevice (docs/DECISION_LOG.md, 2026-07-16, "Fix:
+  // BindDevice replay"). A client must sign a device-binding assertion
+  // against the *current* epoch — fetch it here (via CreateIdentity or
+  // ResolveIdentity) immediately before signing, since a proof signed
+  // against a stale epoch is rejected by design, not a bug.
+  int64 epoch = 5;
+}
+
+message CreateIdentityRequest {
+  string display_name = 1;
+  bytes public_key = 2;
+  bytes first_device_public_key = 3;
+  string first_device_name = 4;
+}
+
+message CreateIdentityResponse {
+  PublicIdentity public_identity = 1;
+  Device first_device = 2;
+}
+
+message BindDeviceRequest {
+  string identity_ref = 1;
+  bytes device_public_key = 2;
+  string device_name = 3;
+  bytes authorization_proof = 4;
+}
+
+message BindDeviceResponse {
+  Device device = 1;
+  // The identity's epoch *after* this bind (already advanced) — lets a
+  // client binding several devices in one flow sign the next proof
+  // without a round-trip back through ResolveIdentity.
+  int64 epoch = 2;
+}
+
+message RevokeDeviceRequest {
+  string identity_ref = 1;
+  string device_id = 2;
+}
+
+message RevokeDeviceResponse {
+  // The identity's epoch *after* this revoke — same rationale as
+  // BindDeviceResponse.epoch.
+  int64 epoch = 1;
+}
+
+message ResolveIdentityRequest {
+  string identity_ref = 1;
+}
+
+message ResolveIdentityResponse {
+  PublicIdentity public_identity = 1;
+}
+
+message ListDevicesRequest {
+  string identity_ref = 1;
+}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+}
+
+message ExportIdentityRequest {
+  string identity_ref = 1;
+}
+
+message ExportIdentityResponse {
+  bytes export_blob = 1;
+  string format_version = 2;
+}

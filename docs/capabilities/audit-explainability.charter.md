@@ -52,6 +52,15 @@ In scope for integrity, even though visibility is Permissions' concern:
 | Experience Guardian | ✅ pass | Clearest articulation of Art. 12 among all six charters — local, contextual "why/when" affordances beat a single dense audit dashboard. | 2026-07-06 |
 | Security Steward | ✅ pass | Tamper-evidence (append-only + hash chaining candidate) and over-collection/visibility-leakage risks are concretely named; retention-policy defaults flagged for a follow-up pass once set by the capability engineer. | 2026-07-06 |
 
+**Implementation merge gate (`services/api/internal/audit`):**
+
+| Guardian | Verdict | Notes | Date |
+|---|---|---|---|
+| Constitution Warden | ✅ pass | No findings — content-addressed SHA-256 hash chain verified sound (not just chain-shaped), `VerifyIntegrity` directly proven to catch both a mutated field and a broken link, export bundle independently re-verifiable outside the module. | 2026-07-16 |
+| Security Steward | ✅ pass | No findings on this capability directly (the wave's one veto was on Identity's use of a signature this capability doesn't touch). | 2026-07-16 |
+
+Also implemented: the network-reachable `Emit` HTTP endpoint (`/v1/audit/events`) that Cryptography & Keys' mobile-side `logAuditEvent` stub is waiting for — not yet wired to that stub (a future integration task), but the endpoint itself is real, not a placeholder. Not wired into `services/api/main.go` for a real network perimeter — see `docs/CAPABILITY_REGISTRY.md` Notes for the standing gate pending a Session/Request Authentication capability.
+
 ## 9. Decision log references
 
-See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering.
+See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering, and the 2026-07-16 entries for implementation.

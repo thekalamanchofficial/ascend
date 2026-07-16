@@ -13,7 +13,7 @@ while IFS= read -r marker_loc; do
   marker_line="${marker_loc#*:}"
   next_line=$((marker_line + 1))
   decl=$(sed -n "${next_line}p" "$file")
-  type_name=$(echo "$decl" | grep -oE '^type [A-Za-z0-9_]+ struct' | awk '{print $2}')
+  type_name=$( (echo "$decl" | grep -oE '^type [A-Za-z0-9_]+ struct' | awk '{print $2}') || true)
   [ -z "$type_name" ] && continue
   pkg_dir=$(dirname "$file")
 
@@ -26,7 +26,7 @@ while IFS= read -r marker_loc; do
     echo "ART.9 VIOLATION: ${type_name} (${file}:${next_line}) has Export${type_name} but no *_export_test.go in ${pkg_dir} references it"
     fail=1
   fi
-done < <(grep -rn --include='*.go' -l 'ascend:persisted' . 2>/dev/null | xargs -r grep -Hn 'ascend:persisted' | sed -E 's/^([^:]+):([0-9]+):.*/\1:\2/')
+done < <(grep -rnE --include='*.go' -l '^[[:space:]]*//[[:space:]]*ascend:persisted[[:space:]]*$' . 2>/dev/null | xargs -r grep -HnE '^[[:space:]]*//[[:space:]]*ascend:persisted[[:space:]]*$' | sed -E 's/^([^:]+):([0-9]+):.*/\1:\2/')
 
 if [ "$fail" -eq 0 ]; then
   echo "Art. 9 (exportability): OK"

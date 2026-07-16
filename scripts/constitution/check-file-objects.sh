@@ -12,7 +12,7 @@ while IFS= read -r marker_loc; do
   marker_line="${marker_loc#*:}"
   decl_line=$((marker_line + 1))
   decl=$(sed -n "${decl_line}p" "$file")
-  type_name=$(echo "$decl" | grep -oE '^type [A-Za-z0-9_]+ struct' | awk '{print $2}')
+  type_name=$( (echo "$decl" | grep -oE '^type [A-Za-z0-9_]+ struct' | awk '{print $2}') || true)
   [ -z "$type_name" ] && continue
 
   close_offset=$(tail -n "+${decl_line}" "$file" | grep -n '^}' | head -1 | cut -d: -f1 || true)
@@ -30,7 +30,7 @@ while IFS= read -r marker_loc; do
       fail=1
     fi
   done
-done < <(grep -rn --include='*.go' -l 'ascend:file-object' . 2>/dev/null | xargs -r grep -Hn 'ascend:file-object' | sed -E 's/^([^:]+):([0-9]+):.*/\1:\2/')
+done < <(grep -rnE --include='*.go' -l '^[[:space:]]*//[[:space:]]*ascend:file-object[[:space:]]*$' . 2>/dev/null | xargs -r grep -HnE '^[[:space:]]*//[[:space:]]*ascend:file-object[[:space:]]*$' | sed -E 's/^([^:]+):([0-9]+):.*/\1:\2/')
 
 if [ "$fail" -eq 0 ]; then
   echo "Art. 2 (files first-class): OK"

@@ -8,6 +8,7 @@ import {
   exportKeyMaterial,
   secureLocalStore,
   secureLocalRetrieve,
+  sign,
 } from "../index";
 import { _resetRegistryForTests, getPrivateKeyEntry, getRatchetSession } from "../keyRegistry";
 import { deriveNextMessageKey, ratchetAdvance, ROOT_INFO, CHAIN_INFO } from "../ratchet";
@@ -19,7 +20,7 @@ import {
 } from "../secureStore";
 import { isValidRecoveryPhrase } from "../mnemonic";
 import { encryptEnvelope, decryptEnvelope } from "../envelope";
-import { x25519 } from "@noble/curves/ed25519.js";
+import { x25519, ed25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import * as audit from "../audit";
@@ -30,7 +31,7 @@ beforeEach(() => {
 });
 
 describe("GenerateIdentityKeyMaterial", () => {
-  it("returns a 32-byte X25519 public key, a handle, and a valid 24-word recovery phrase", () => {
+  it("returns a 32-byte Ed25519 public key, a handle, and a valid 24-word recovery phrase", () => {
     const result = generateIdentityKeyMaterial({});
     expect(result.publicKey).toBeInstanceOf(Uint8Array);
     expect(result.publicKey.length).toBe(32);
@@ -83,7 +84,7 @@ describe("deterministic derivation (RestoreFromRecoveryPhrase)", () => {
 });
 
 describe("GenerateKeyPair", () => {
-  it("produces a usable X25519 keypair distinct from the identity key", () => {
+  it("produces a usable X25519 (DH-capable) keypair, distinct from the identity key (which is Ed25519 — see keyPurpose.ts)", () => {
     const identity = generateIdentityKeyMaterial({});
     const session = generateKeyPair({ purpose: "device-session" });
     expect(session.publicKey.length).toBe(32);
@@ -94,12 +95,137 @@ describe("GenerateKeyPair", () => {
   it("requires a purpose", () => {
     expect(() => generateKeyPair({ purpose: "" })).toThrow();
   });
+
+  it("produces an Ed25519 keypair for a 'sign:'-prefixed purpose, distinct from the X25519 public key the same raw bytes would produce", () => {
+    const signingKey = generateKeyPair({ purpose: "sign:device-binding" });
+    expect(signingKey.publicKey.length).toBe(32);
+
+    const entry = getPrivateKeyEntry(signingKey.privateKeyHandle);
+    // Deliberately re-derive both curves' public keys from the SAME raw
+    // private key bytes to confirm they really are different — this is the
+    // concrete reason DH-capable and signing-capable handles can't be the
+    // same underlying key.
+    const asX25519 = x25519.getPublicKey(entry.privateKey);
+    const asEd25519 = ed25519.getPublicKey(entry.privateKey);
+    expect(asEd25519).toEqual(signingKey.publicKey);
+    expect(asX25519).not.toEqual(asEd25519);
+  });
 });
 
+describe("Sign", () => {
+  it("produces a standard 64-byte Ed25519 signature that verifies against the returned public key using @noble/curves directly", () => {
+    const device = generateKeyPair({ purpose: "sign:device-binding" });
+    const message = new TextEncoder().encode("bind device: new-device-id-1234");
+
+    const { signature } = sign({ privateKeyHandle: device.privateKeyHandle, message });
+
+    expect(signature.length).toBe(64);
+    // Verification performed with the raw, unmodified @noble/curves
+    // Ed25519 primitive directly (not any helper from this module) — this
+    // is what proves the signature is standard Ed25519 and not something
+    // this module invented, since no Verify RPC exists on this side (see
+    // docs/DECISION_LOG.md, 2026-07-16 "Crypto & Keys contract gains Sign;
+    // signature verification is not 'own crypto'").
+    expect(ed25519.verify(signature, message, device.publicKey)).toBe(true);
+  });
+
+  it("a tampered message fails verification", () => {
+    const device = generateKeyPair({ purpose: "sign:device-binding" });
+    const message = new TextEncoder().encode("bind device: new-device-id-1234");
+    const { signature } = sign({ privateKeyHandle: device.privateKeyHandle, message });
+
+    const tamperedMessage = new TextEncoder().encode("bind device: attacker-device-id");
+    expect(ed25519.verify(signature, tamperedMessage, device.publicKey)).toBe(false);
+  });
+
+  it("rejects a DH-capable (X25519) handle rather than silently signing with it", () => {
+    const sessionKey = generateKeyPair({ purpose: "device-session" });
+    const message = new TextEncoder().encode("some message");
+
+    expect(() => sign({ privateKeyHandle: sessionKey.privateKeyHandle, message })).toThrow();
+  });
+
+  // Regression coverage for the bug found during Identity's implementation:
+  // the identity root key must itself be signing-capable (Ed25519), because
+  // BindDevice's recovery-path device-binding assertion is produced by
+  // calling Sign() with the identity key. An earlier version registered the
+  // identity key under a bare "identity" purpose (X25519, DH-only), so
+  // Sign() correctly-but-wrongly rejected it — the assertion could never
+  // actually be produced. See docs/DECISION_LOG.md, 2026-07-16 "Fix:
+  // identity root key must be Ed25519 (signing-capable), not X25519".
+  it("signs successfully with the freshly generated identity root key (the BindDevice use case this fix restores)", () => {
+    const identity = generateIdentityKeyMaterial({});
+    const message = new TextEncoder().encode("bind device: new-device-id-1234");
+
+    const { signature } = sign({ privateKeyHandle: identity.privateKeyHandle, message });
+
+    expect(signature.length).toBe(64);
+    expect(ed25519.verify(signature, message, identity.publicKey)).toBe(true);
+  });
+
+  it("signs successfully with a RestoreFromRecoveryPhrase-restored identity — the exact recovery-path device-binding scenario Security Steward scrutinized (the only path that survives total device loss)", () => {
+    const original = generateIdentityKeyMaterial({});
+    const restored = restoreFromRecoveryPhrase({ recoveryPhrase: original.recoveryPhrase });
+    expect(restored.publicKey).toEqual(original.publicKey);
+
+    const message = new TextEncoder().encode("bind device: recovered-device-id-5678");
+    const { signature } = sign({ privateKeyHandle: restored.privateKeyHandle, message });
+
+    expect(ed25519.verify(signature, message, restored.publicKey)).toBe(true);
+    // Also verifies against the ORIGINAL identity's public key, since
+    // restoration is deterministic and must produce the same signing
+    // identity a counterparty already trusts.
+    expect(ed25519.verify(signature, message, original.publicKey)).toBe(true);
+  });
+});
+
+describe("Sign/DH key-type separation on the DH-only operations", () => {
+  it("Decrypt rejects a signing-capable (Ed25519) handle", () => {
+    const signingKey = generateKeyPair({ purpose: "sign:device-binding" });
+    const bob = generateKeyPair({ purpose: "device-session" });
+    const { ciphertext } = encrypt({
+      recipientPublicKeys: [bob.publicKey],
+      plaintext: new TextEncoder().encode("hi"),
+    });
+    expect(() => decrypt({ privateKeyHandle: signingKey.privateKeyHandle, ciphertext })).toThrow();
+  });
+
+  it("DeriveSharedSecret rejects a signing-capable (Ed25519) handle", () => {
+    const signingKey = generateKeyPair({ purpose: "sign:device-binding" });
+    const bob = generateKeyPair({ purpose: "device-session" });
+    expect(() =>
+      deriveSharedSecret({ privateKeyHandle: signingKey.privateKeyHandle, remotePublicKey: bob.publicKey }),
+    ).toThrow();
+  });
+
+  it("Decrypt rejects the identity key itself (Ed25519, signing-only — never a DH/encryption key)", () => {
+    const identity = generateIdentityKeyMaterial({});
+    const someRecipient = generateKeyPair({ purpose: "device-session" });
+    const { ciphertext } = encrypt({
+      recipientPublicKeys: [someRecipient.publicKey],
+      plaintext: new TextEncoder().encode("hi"),
+    });
+    expect(() => decrypt({ privateKeyHandle: identity.privateKeyHandle, ciphertext })).toThrow();
+  });
+
+  it("DeriveSharedSecret rejects the identity key itself (Ed25519, signing-only — never a DH key)", () => {
+    const identity = generateIdentityKeyMaterial({});
+    const remote = generateKeyPair({ purpose: "device-session" });
+    expect(() =>
+      deriveSharedSecret({ privateKeyHandle: identity.privateKeyHandle, remotePublicKey: remote.publicKey }),
+    ).toThrow();
+  });
+});
+
+// Encrypt/Decrypt operate on DH-capable (X25519) key handles — generated
+// here via GenerateKeyPair with a non-"sign:" purpose (e.g. a per-device
+// session key), never the identity root key, which is Ed25519 and
+// signing-only (see keyPurpose.ts and the "Sign/DH key-type separation"
+// describe block above for the rejection behavior).
 describe("Encrypt / Decrypt round trip", () => {
-  it("round-trips plaintext between two independently generated identities", () => {
-    const alice = generateIdentityKeyMaterial({});
-    const bob = generateIdentityKeyMaterial({});
+  it("round-trips plaintext between two independently generated device keys", () => {
+    const alice = generateKeyPair({ purpose: "device-session" });
+    const bob = generateKeyPair({ purpose: "device-session" });
     const plaintext = new TextEncoder().encode("the eagle flies at midnight");
 
     const { ciphertext } = encrypt({ recipientPublicKeys: [bob.publicKey], plaintext });
@@ -112,9 +238,9 @@ describe("Encrypt / Decrypt round trip", () => {
   });
 
   it("supports multiple recipients, each independently able to decrypt", () => {
-    const bob = generateIdentityKeyMaterial({});
-    const carol = generateIdentityKeyMaterial({});
-    const dave = generateIdentityKeyMaterial({});
+    const bob = generateKeyPair({ purpose: "device-session" });
+    const carol = generateKeyPair({ purpose: "device-session" });
+    const dave = generateKeyPair({ purpose: "device-session" });
     const plaintext = new TextEncoder().encode("group secret");
 
     const { ciphertext } = encrypt({
@@ -132,7 +258,7 @@ describe("Encrypt / Decrypt round trip", () => {
   });
 
   it("detects tampering (AEAD authentication)", () => {
-    const bob = generateIdentityKeyMaterial({});
+    const bob = generateKeyPair({ purpose: "device-session" });
     const plaintext = new TextEncoder().encode("do not modify me");
     const { ciphertext } = encrypt({ recipientPublicKeys: [bob.publicKey], plaintext });
 
@@ -147,7 +273,7 @@ describe("Encrypt / Decrypt round trip", () => {
   });
 
   it("low-level envelope round trip works directly (sanity check for the wire format)", () => {
-    const bob = generateIdentityKeyMaterial({});
+    const bob = generateKeyPair({ purpose: "device-session" });
     const bobEntry = getPrivateKeyEntry(bob.privateKeyHandle);
     const pt = new TextEncoder().encode("wire format sanity check");
     const ct = encryptEnvelope([bob.publicKey], pt);
@@ -156,10 +282,14 @@ describe("Encrypt / Decrypt round trip", () => {
   });
 });
 
+// DeriveSharedSecret operates on DH-capable (X25519) key handles — device
+// keys generated via GenerateKeyPair with a non-"sign:" purpose, never the
+// identity root key (Ed25519, signing-only — rejected, see "Sign/DH
+// key-type separation" above).
 describe("DeriveSharedSecret and ratchet forward secrecy / post-compromise security", () => {
   it("derives a fresh root key on every call, even for the exact same static keypair (no key-reuse hazard)", () => {
-    const alice = generateIdentityKeyMaterial({});
-    const bob = generateIdentityKeyMaterial({});
+    const alice = generateKeyPair({ purpose: "device-session" });
+    const bob = generateKeyPair({ purpose: "device-session" });
 
     const sessionA = deriveSharedSecret({
       privateKeyHandle: alice.privateKeyHandle,
@@ -187,8 +317,8 @@ describe("DeriveSharedSecret and ratchet forward secrecy / post-compromise secur
   });
 
   it("forward secrecy at handshake time: compromising the long-term static private key does not let an attacker recompute the session's chain key derived before any ratchetAdvance() call", () => {
-    const alice = generateIdentityKeyMaterial({});
-    const bob = generateIdentityKeyMaterial({});
+    const alice = generateKeyPair({ purpose: "device-session" });
+    const bob = generateKeyPair({ purpose: "device-session" });
 
     const session = deriveSharedSecret({
       privateKeyHandle: alice.privateKeyHandle,
@@ -219,8 +349,8 @@ describe("DeriveSharedSecret and ratchet forward secrecy / post-compromise secur
   });
 
   it("forward secrecy: advancing the chain ratchet changes the chain key so the previous message key cannot be recomputed from the new state", () => {
-    const alice = generateIdentityKeyMaterial({});
-    const bob = generateIdentityKeyMaterial({});
+    const alice = generateKeyPair({ purpose: "device-session" });
+    const bob = generateKeyPair({ purpose: "device-session" });
     const session = deriveSharedSecret({
       privateKeyHandle: alice.privateKeyHandle,
       remotePublicKey: bob.publicKey,
@@ -239,8 +369,8 @@ describe("DeriveSharedSecret and ratchet forward secrecy / post-compromise secur
   });
 
   it("post-compromise security: a DH ratchet step produces a root key that could not have been predicted from the old root key alone", () => {
-    const alice = generateIdentityKeyMaterial({});
-    const bob = generateIdentityKeyMaterial({});
+    const alice = generateKeyPair({ purpose: "device-session" });
+    const bob = generateKeyPair({ purpose: "device-session" });
     const session = deriveSharedSecret({
       privateKeyHandle: alice.privateKeyHandle,
       remotePublicKey: bob.publicKey,
@@ -314,7 +444,7 @@ describe("ExportKeyMaterial", () => {
 
     const identityEntry = parsed.keys.find((k: { handle: string }) => k.handle === identity.privateKeyHandle.handle);
     expect(identityEntry).toBeDefined();
-    expect(identityEntry.purpose).toBe("identity");
+    expect(identityEntry.purpose).toBe("sign:identity");
     expect(typeof identityEntry.privateKey).toBe("string"); // base64
 
     const deviceEntry = parsed.keys.find((k: { handle: string }) => k.handle === device.privateKeyHandle.handle);
@@ -326,11 +456,16 @@ describe("ExportKeyMaterial", () => {
     const identity = generateIdentityKeyMaterial({});
     const result = exportKeyMaterial({ userConfirmation: true });
     const parsed = JSON.parse(new TextDecoder().decode(result.exportBlob));
-    const identityEntry = parsed.keys.find((k: { purpose: string }) => k.purpose === "identity");
+    const identityEntry = parsed.keys.find((k: { purpose: string }) => k.purpose === "sign:identity");
 
-    const { x25519 } = require("@noble/curves/ed25519.js");
+    // Re-derived with Ed25519, not X25519 — the identity key is
+    // signing-capable (see docs/DECISION_LOG.md, 2026-07-16 "Fix: identity
+    // root key must be Ed25519 (signing-capable), not X25519"). Re-deriving
+    // with the wrong curve would silently produce a DIFFERENT public key
+    // and this assertion would (correctly) fail.
+    const { ed25519: reDerivedEd25519 } = require("@noble/curves/ed25519.js");
     const base64ToBytesLocal = (b64: string) => Uint8Array.from(Buffer.from(b64, "base64"));
-    const rederivedPublicKey = x25519.getPublicKey(base64ToBytesLocal(identityEntry.privateKey));
+    const rederivedPublicKey = reDerivedEd25519.getPublicKey(base64ToBytesLocal(identityEntry.privateKey));
     expect(rederivedPublicKey).toEqual(identity.publicKey);
   });
 });

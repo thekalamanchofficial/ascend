@@ -35,6 +35,26 @@ service CryptoService {
   rpc Encrypt(EncryptRequest) returns (EncryptResponse);
   rpc Decrypt(DecryptRequest) returns (DecryptResponse);
 
+  // Produces a digital signature over `message` using the private key
+  // behind `private_key_handle`. Added 2026-07-16 for Identity's
+  // BindDevice (docs/capabilities/identity.charter.md §3): an
+  // already-bound device proves authorization for a new device by signing
+  // a binding assertion, not by any weaker shared-secret mechanism. Only
+  // key handles obtained for a signing-capable purpose can be used here —
+  // which purposes qualify, and the exact signature algorithm, are
+  // implementation decisions for this capability's engineer (consistent
+  // with charter §7's existing delegation of algorithm choice), but must
+  // be a standard, unmodified, well-reviewed signature scheme (e.g.
+  // Ed25519), documented in docs/DECISION_LOG.md. There is no
+  // corresponding `Verify` RPC: verifying a signature requires only the
+  // public key, involves no private key material or cryptographic
+  // *design* decision, and consuming capabilities (e.g. Identity) may
+  // implement verification directly against a documented, standard
+  // algorithm without that counting as "implementing their own crypto" in
+  // the sense charter §3 forbids (see docs/DECISION_LOG.md, 2026-07-16,
+  // "Signature verification is not 'own crypto'").
+  rpc Sign(SignRequest) returns (SignResponse);
+
   // Session/channel key agreement. Implementation must provide forward
   // secrecy and post-compromise security (charter §6) — construction choice
   // (e.g. double ratchet) is left to the capability engineer.
@@ -60,6 +80,15 @@ service CryptoService {
 // contains raw key bytes.
 message KeyHandle {
   string handle = 1;
+}
+
+message SignRequest {
+  KeyHandle private_key_handle = 1;
+  bytes message = 2;
+}
+
+message SignResponse {
+  bytes signature = 1;
 }
 
 message GenerateIdentityKeyMaterialRequest {}

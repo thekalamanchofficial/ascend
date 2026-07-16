@@ -88,3 +88,12 @@ export interface ExportKeyMaterialResponse {
   exportBlob: Uint8Array;
   formatVersion: string;
 }
+
+export interface SignRequest {
+  privateKeyHandle: KeyHandle;
+  message: Uint8Array;
+}
+
+export interface SignResponse {
+  signature: Uint8Array;
+}

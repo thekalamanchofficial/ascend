@@ -11,9 +11,9 @@ Each capability gets one row here and one charter at `docs/capabilities/<capabil
 | Capability | Status | Owner (subagent) | Charter | Depends on | Consumed by |
 |---|---|---|---|---|---|
 | Cryptography & Keys | `stable` | capability-engineer | [charter](capabilities/cryptography-and-keys.charter.md) | Audit / Explainability | Identity, Permissions, Storage, File Objects |
-| Identity | `gated` | capability-engineer (to spawn) | [charter](capabilities/identity.charter.md) | Cryptography & Keys, Audit / Explainability | Permissions, File Objects |
-| Permissions | `gated` | capability-engineer (to spawn) | [charter](capabilities/permissions.charter.md) | Identity, Audit / Explainability | Storage, File Objects |
-| Audit / Explainability | `gated` | capability-engineer (to spawn) | [charter](capabilities/audit-explainability.charter.md) | Identity, Permissions | Identity, Cryptography & Keys, Permissions, Storage, File Objects |
+| Identity | `stable` | capability-engineer | [charter](capabilities/identity.charter.md) | Cryptography & Keys, Audit / Explainability | Permissions, File Objects |
+| Permissions | `stable` | capability-engineer | [charter](capabilities/permissions.charter.md) | Identity, Audit / Explainability | Storage, File Objects |
+| Audit / Explainability | `stable` | capability-engineer | [charter](capabilities/audit-explainability.charter.md) | Identity, Permissions | Identity, Cryptography & Keys, Permissions, Storage, File Objects |
 | Storage | `gated` | capability-engineer (to spawn) | [charter](capabilities/storage.charter.md) | Cryptography & Keys, Permissions, Audit / Explainability | File Objects |
 | File Objects | `gated` | capability-engineer (to spawn) | [charter](capabilities/file-objects.charter.md) | Storage, Permissions, Identity, Cryptography & Keys, Audit / Explainability | (features, once chartered) |
 
@@ -24,3 +24,4 @@ Each capability gets one row here and one charter at `docs/capabilities/<capabil
 - A capability moves to `frozen` only after all applicable guardian gates (Constitution Warden always; Experience Guardian and/or Security Steward if their surface is touched) sign off on the charter — see the gate results recorded in each charter file and cross-referenced in `docs/DECISION_LOG.md`.
 - "Depends on" must reference only other capabilities' published contracts in `packages/contracts`, never internal implementation details (Article 10).
 - When a capability is deprecated, its replacement and migration/export path must be recorded before removal (Article 9).
+- **Standing gate, binding (docs/DECISION_LOG.md, 2026-07-16):** Identity, Permissions, and Audit / Explainability are `stable` as Go packages but **not wired into `services/api/main.go`, and not exposed on any reachable network perimeter**, pending a chartered Session/Request Authentication capability (see open task). Wiring any of the three into `main.go` before that capability lands requires a fresh Security Steward gate on that specific act.
