@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package ascend.audit.v1;
 
+option go_package = "github.com/ascend/services/api/gen/go/ascend/audit/v1;auditv1";
+
 // Audit / Explainability — the standard "why/when/by-what-rule" event
 // substrate every state-changing action in Ascend emits into (Art. 5).
 // Frozen from docs/capabilities/audit-explainability.charter.md §3.

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package ascend.identity.v1;
 
+option go_package = "github.com/ascend/services/api/gen/go/ascend/identity/v1;identityv1";
+
 // Identity — user-owned identity and device/key binding, no silent
 // server-side identity authority. Frozen from
 // docs/capabilities/identity.charter.md §3.

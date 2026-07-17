@@ -13,6 +13,7 @@ dist/
 services/api/gen/
 services/api/*.exe
 services/api/tmp/
+services/api/internal/storage/.data/
 
 # python
 services/ai/gen/

@@ -75,6 +75,7 @@ export * from "./types";
 // handles.
 const IDENTITY_KEY_PURPOSE = "sign:identity";
 
+// ascend:mutates
 export function generateIdentityKeyMaterial(
   _request: GenerateIdentityKeyMaterialRequest = {},
 ): GenerateIdentityKeyMaterialResponse {
@@ -97,6 +98,7 @@ export function generateIdentityKeyMaterial(
 // GenerateKeyPair
 // ---------------------------------------------------------------------------
 
+// ascend:mutates
 export function generateKeyPair(request: GenerateKeyPairRequest): GenerateKeyPairResponse {
   if (!request.purpose) {
     logAuditEvent("key_pair_generation_rejected", { reason: "empty_purpose" });
@@ -178,6 +180,7 @@ export function decrypt(request: DecryptRequest): DecryptResponse {
  * `BindDevice` produces a real device-binding signature, including from a
  * recovery-phrase-restored identity after total device loss.
  */
+// ascend:mutates
 export function sign(request: SignRequest): SignResponse {
   const entry = keyRegistry.getPrivateKeyEntry(request.privateKeyHandle);
   if (!isSigningPurpose(entry.purpose)) {
@@ -204,6 +207,7 @@ export function sign(request: SignRequest): SignResponse {
 // DeriveSharedSecret
 // ---------------------------------------------------------------------------
 
+// ascend:mutates
 export function deriveSharedSecret(request: DeriveSharedSecretRequest): DeriveSharedSecretResponse {
   const entry = keyRegistry.getPrivateKeyEntry(request.privateKeyHandle);
   if (isSigningPurpose(entry.purpose)) {
@@ -251,6 +255,7 @@ export async function secureLocalRetrieve(
 // RestoreFromRecoveryPhrase
 // ---------------------------------------------------------------------------
 
+// ascend:mutates
 export function restoreFromRecoveryPhrase(
   request: RestoreFromRecoveryPhraseRequest,
 ): RestoreFromRecoveryPhraseResponse {
@@ -324,6 +329,7 @@ export function restoreFromRecoveryPhrase(
  */
 const EXPORT_FORMAT_VERSION = "ascend-crypto-export-v1";
 
+// ascend:mutates
 export function exportKeyMaterial(request: ExportKeyMaterialRequest): ExportKeyMaterialResponse {
   if (!request.userConfirmation) {
     logAuditEvent("key_material_export_refused", { reason: "missing_user_confirmation" });

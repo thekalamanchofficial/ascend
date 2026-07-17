@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package ascend.permissions.v1;
 
+option go_package = "github.com/ascend/services/api/gen/go/ascend/permissions/v1;permissionsv1";
+
 // Permissions — fine-grained, least-privilege access control every other
 // capability calls to decide who may do what to which resource. Frozen
 // from docs/capabilities/permissions.charter.md §3.

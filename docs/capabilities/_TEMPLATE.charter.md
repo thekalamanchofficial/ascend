@@ -14,6 +14,8 @@ Does this capability increase the user's ownership of digital communication? Sta
 
 **Consumes** (what other capabilities this depends on, referenced only by their published contracts):
 
+> **On implementation-time scope extensions** (precedent set 2026-07-17, Storage capability): a capability-engineer may, without stopping to ask, extend an *authorization check* to a request field that is **already present in the frozen contract** — e.g. gating an additional RPC on `CheckPermission` using a `requesting_subject` field the `.proto` already carries — provided the extension only *increases* a security/ownership guarantee, is self-flagged explicitly in the decision log as going beyond the charter's literal text (not silently merged as settled fact), and requires no change to the wire contract itself. This is routine engineering judgment, confirmed at the merge gate, not a charter violation. It does **not** license extending the *wire contract* — a new field, a new RPC, a changed message shape — which always requires a Chief Architect amendment before implementation, same as any other contract change. If in doubt which category a change falls into, treat it as a wire-contract change and ask first.
+
 ## 4. Constitutional obligations
 
 Which articles does this capability's design have to actively satisfy, and how? Be specific — "satisfies Art. 8" is not sufficient; state what data is collected, why, and what is deliberately not collected.

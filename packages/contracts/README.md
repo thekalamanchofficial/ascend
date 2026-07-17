@@ -15,8 +15,10 @@ Protocol Buffers, managed with [Buf](https://buf.build). See `docs/DECISION_LOG.
 1. A capability charter is gated by the guardians and its §3 Interface section is frozen (see root `CLAUDE.md` §Workflow).
 2. Add or amend the corresponding `.proto` file here.
 3. Run Buf lint + breaking-change check (wired into `.github/workflows/constitution.yml`) before merge — a breaking change to a frozen contract is itself a constitutional question (Art. 10) and should go back through the charter process, not be pushed through silently.
-4. Regenerate bindings; capability engineers implement against the generated types, never hand-roll a parallel definition.
+4. Regenerate bindings (`cd packages/contracts && buf generate` — uses Buf's remote plugin execution, no local protoc/plugin install required); capability engineers implement against the generated types, never hand-roll a parallel definition.
 
 ## Status
 
-Scaffolding only — no capability `.proto` files yet. Contracts get added as each Phase 1 capability charter is frozen; see `docs/CAPABILITY_REGISTRY.md`.
+Four contracts frozen: `crypto`, `identity`, `permissions`, `audit` (each `option go_package`-annotated for Go codegen). `buf generate` is wired and verified working (2026-07-16) — it produces Go structs + gRPC stubs into `services/api/gen/go/`, TypeScript message types into `gen/ts/` (consumed by `apps/mobile`), and Python types into `services/ai/gen/python/`; all three are gitignored, regenerated from source, never committed.
+
+**One deliberate exception to step 4 above, recorded for anyone confused why existing code doesn't import `gen/go`:** the four capability-engineers who implemented against these contracts before this codegen toolchain existed (Cryptography & Keys, Identity, Permissions, Audit / Explainability — see `docs/DECISION_LOG.md`, 2026-07-16 wave entries) hand-mirrored the proto message shapes in their own packages, per explicit instruction at the time ("no codegen wired yet"). Those four are `stable`, guardian-gated, and working — they were **not** retroactively migrated to the generated types, to avoid churning already-reviewed code for no functional gain. Every capability chartered from here forward (Storage, File Objects, Session / Request Authentication, ...) implements directly against `buf generate`'s output, per step 4. Migrating the four existing ones is optional future cleanup, not a live gap.

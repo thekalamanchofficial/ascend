@@ -21,7 +21,7 @@ Yes. Where data lives, and whether a copy exists somewhere the user didn't choos
 
 **Consumes:**
 - **Cryptography & Keys** — every blob is encrypted by Cryptography & Keys before Storage ever receives it, and decrypted only after Cryptography & Keys retrieves it back out. Storage never observes plaintext at any point; it stores and returns ciphertext only.
-- **Permissions** — `RetrieveBlob` checks `CheckPermission` before returning data.
+- **Permissions** — `RetrieveBlob`, `MoveBlob`, and `DeleteBlob` all check `CheckPermission` before acting. (The latter two were extended to this at implementation time, 2026-07-17 — the original charter text named only `RetrieveBlob`, but `MoveBlobRequest`/`DeleteBlobRequest` already carried `requesting_subject` in the frozen contract, and leaving them ungated would have been a real access-control gap the frozen interface itself already anticipated. Confirmed sound by both guardians at the merge gate — see `docs/DECISION_LOG.md`.)
 - **Audit / Explainability** — store/move/delete operations are audited.
 
 ## 4. Constitutional obligations
@@ -59,6 +59,15 @@ In scope — Storage defines the boundary between "on the user's device/control"
 | Experience Guardian | ✅ pass | "Where's my data" is a novel-but-earned mental model; recommended (and now incorporated) an explicit statement that storage-policy selection is never a mandatory step in file/message creation flows. | 2026-07-06 |
 | Security Steward | ✅ pass (after amendment) | Initially vetoed for lacking any blob deletion/purge primitive, undermining Art. 1/15 deletion guarantees; resolved by adding `DeleteBlob` with an atomic/audited/crypto-shred-fallback guarantee — see `docs/DECISION_LOG.md`. | 2026-07-06 |
 
+**Implementation merge gate (`services/api/internal/storage`):**
+
+| Guardian | Verdict | Notes | Date |
+|---|---|---|---|
+| Constitution Warden | ✅ pass | No blocking findings. Confirmed the `StoreBlob`-rolls-back-on-audit-failure divergence from Identity/Permissions' "fail loudly, mutation stands" pattern is deliberate and correct (`blob_ref` is the sole handle to newly-created data — an unaudited-but-committed blob would be permanently unreachable, a worse Art. 15 hazard than a retriable grant failure). Required the self-flagged `CheckPermission` extension to `MoveBlob`/`DeleteBlob` be reflected in this charter's §3 (done, above) and the general precedent recorded in the charter template (done). | 2026-07-17 |
+| Security Steward | ✅ pass | Independently verified the crypto-shred guarantee is real (captured the wrapping key pre-delete, proved decryption works, then proved it's destroyed post-delete and the remaining ciphertext is unrecoverable), confirmed the wrapping key is structurally unable to leak through export (no field exists for it), and ruled the `CheckPermission` extension a genuine security improvement, not scope creep. Flagged two pre-existing, frozen-contract-level gaps — `ExportAllBlobsRequest`/`GetStorageLocationRequest` carry no caller-identity field to gate against — required before `Mount` is ever wired to a live network path, not blocking this merge (nothing is wired yet). Also recommended concurrency-hardening `DeleteBlob`/`MoveBlob` with a `-race`-verified test before going live, matching the rigor Session/Request Authentication's nonce consumption got. | 2026-07-17 |
+
+Not wired into `services/api/main.go` — see `docs/CAPABILITY_REGISTRY.md` Notes. Two contract gaps tracked as required-before-network-exposure (see decision log): `ExportAllBlobsRequest` and `GetStorageLocationRequest` need a caller-identity field before this capability can safely go live.
+
 ## 9. Decision log references
 
-See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering.
+See `docs/DECISION_LOG.md`, 2026-07-06 entries for Phase 1 chartering, and the 2026-07-17 entries for implementation and the merge-gate pass.

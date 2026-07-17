@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package ascend.storage.v1;
+
+option go_package = "github.com/ascend/services/api/gen/go/ascend/storage/v1;storagev1";
+
+// Storage — local-first storage abstraction where the user chooses (or
+// knows) where their data physically lives, with no hidden remote copies.
+// Frozen from docs/capabilities/storage.charter.md §3.
+//
+// IMPLEMENTATION (charter §3, §4): a normal Go backend service in
+// services/api/internal/storage, like Identity/Permissions/Audit — not
+// on-device like Cryptography & Keys. Storage never observes plaintext:
+// every blob it receives was already encrypted end-to-end, client-side, by
+// Cryptography & Keys before this service ever sees it. Storage has no
+// access to that end-to-end content key at any point.
+//
+// DELETION / CRYPTO-SHRED (docs/DECISION_LOG.md, 2026-07-06, "Storage
+// gains an explicit deletion primitive", and 2026-07-16 clarification):
+// because Storage never holds the end-to-end content key, it cannot
+// "shred" that key — only the client that encrypted the content could.
+// Where physical byte-level erasure can't be guaranteed by a backend
+// (e.g. some replicated object-storage models), Storage's crypto-shred
+// fallback instead uses a *storage-layer* wrapping key that Storage
+// itself generates and holds for that blob (a second, outer encryption
+// envelope around the already-opaque client-encrypted bytes) — destroying
+// that self-owned wrapping key is something Storage can actually do,
+// unlike the content key. This wrapping is a backend-only operational
+// concern, implemented directly with Go's standard library (analogous to
+// Identity verifying signatures directly rather than reimplementing
+// Cryptography & Keys' job) — it is not a second layer of end-to-end
+// encryption and must never be presented to a user as one.
+
+service StorageService {
+  rpc StoreBlob(StoreBlobRequest) returns (StoreBlobResponse);
+  rpc RetrieveBlob(RetrieveBlobRequest) returns (RetrieveBlobResponse);
+
+  // Explicit, user-visible relocation. Never a silent background
+  // migration (charter §6).
+  rpc MoveBlob(MoveBlobRequest) returns (MoveBlobResponse);
+
+  // Atomic, audited, permanent. No residual copy under the blob's
+  // storage policy — physical erasure where the backend guarantees it,
+  // crypto-shred of Storage's own wrapping key otherwise (see header).
+  rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);
+
+  rpc GetStorageLocation(GetStorageLocationRequest) returns (GetStorageLocationResponse);
+
+  // The set of location choices actually available right now — feeds
+  // charter §5's "real choice, not a hidden default" requirement directly;
+  // must never return a policy this service can't actually honor.
+  rpc ListStoragePolicies(ListStoragePoliciesRequest) returns (ListStoragePoliciesResponse);
+
+  rpc ExportAllBlobs(ExportAllBlobsRequest) returns (ExportAllBlobsResponse);
+}
+
+message StoragePolicy {
+  string policy_id = 1;
+  string display_name = 2;
+  string description = 3;
+}
+
+message StoreBlobRequest {
+  string owner = 1;   // opaque identity_ref
+  bytes data = 2;     // already end-to-end encrypted by the caller; opaque to Storage
+  string policy_id = 3;
+}
+
+message StoreBlobResponse {
+  string blob_ref = 1;
+}
+
+message RetrieveBlobRequest {
+  string blob_ref = 1;
+  // The true acting subject requesting retrieval — charter §3 requires
+  // CheckPermission gating before data is returned. Never a calling
+  // capability's own service identity (same confused-deputy discipline
+  // as Permissions.CheckPermission itself).
+  string requesting_subject = 2;
+}
+
+message RetrieveBlobResponse {
+  bytes data = 1;
+}
+
+message MoveBlobRequest {
+  string blob_ref = 1;
+  string new_policy_id = 2;
+  string requesting_subject = 3;
+}
+
+message MoveBlobResponse {
+  string new_location = 1;
+}
+
+message DeleteBlobRequest {
+  string blob_ref = 1;
+  string requesting_subject = 2;
+}
+
+message DeleteBlobResponse {}
+
+message GetStorageLocationRequest {
+  string blob_ref = 1;
+}
+
+message GetStorageLocationResponse {
+  string human_readable_location = 1;
+}
+
+message ListStoragePoliciesRequest {}
+
+message ListStoragePoliciesResponse {
+  repeated StoragePolicy policies = 1;
+}
+
+message ExportAllBlobsRequest {
+  string owner = 1;
+}
+
+message ExportAllBlobsResponse {
+  bytes export_blob = 1;
+  string format_version = 2;
+}

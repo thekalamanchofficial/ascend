@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package ascend.sessionauth.v1;
+
+option go_package = "github.com/ascend/services/api/gen/go/ascend/sessionauth/v1;sessionauthv1";
+
+// Session / Request Authentication — proves which bound device of which
+// identity is making a given request. Frozen from
+// docs/capabilities/session-authentication.charter.md §3.
+//
+// IMPLEMENTATION: a normal Go backend service, services/api/internal/sessionauth,
+// same pattern as Identity/Permissions/Audit/Storage. Sessions are
+// server-side records looked up on every ValidateSession call — never a
+// self-contained/stateless token whose validity can't be revoked (charter
+// §6). IssueSession's freshness requirement (GetSessionChallenge's
+// single-use nonce, consumed on success) and its canonical
+// domain-separated signed-message construction are charter-mandated, not
+// implementation-engineer discretion — see charter §3 for the exact byte
+// layout: "ascend.session.v1.IssueSession" || 0x00 || identity_ref || 0x00
+// || device_id || 0x00 || challenge_nonce.
+
+service SessionAuthService {
+  rpc GetSessionChallenge(GetSessionChallengeRequest) returns (GetSessionChallengeResponse);
+  rpc IssueSession(IssueSessionRequest) returns (IssueSessionResponse);
+  rpc ValidateSession(ValidateSessionRequest) returns (ValidateSessionResponse);
+  rpc RevokeSession(RevokeSessionRequest) returns (RevokeSessionResponse);
+
+  // Takes the caller's own currently-valid session token, never a bare
+  // identity_ref (charter §3 — identity_ref is a public, unauthenticated
+  // lookup value via Identity's ResolveIdentity, so accepting it directly
+  // here would let any caller act on an arbitrary identity).
+  rpc RevokeAllSessions(RevokeAllSessionsRequest) returns (RevokeAllSessionsResponse);
+  rpc ListActiveSessions(ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
+  rpc ExportSessions(ExportSessionsRequest) returns (ExportSessionsResponse);
+}
+
+message SessionSummary {
+  string device_id = 1;
+  int64 issued_at_unix = 2;
+  int64 expires_at_unix = 3;
+  int64 last_used_at_unix = 4;
+}
+
+message GetSessionChallengeRequest {
+  string identity_ref = 1;
+  string device_id = 2;
+}
+
+message GetSessionChallengeResponse {
+  string challenge_nonce = 1;
+  int64 challenge_expires_at_unix = 2;
+}
+
+message IssueSessionRequest {
+  string identity_ref = 1;
+  string device_id = 2;
+  string challenge_nonce = 3;
+  // Signature over the canonical domain-separated message described in
+  // the file header, produced client-side via Cryptography & Keys' Sign.
+  bytes proof = 4;
+}
+
+message IssueSessionResponse {
+  string session_token = 1;
+  int64 expires_at_unix = 2;
+}
+
+message ValidateSessionRequest {
+  string session_token = 1;
+}
+
+message ValidateSessionResponse {
+  string identity_ref = 1;
+  string device_id = 2;
+  bool valid = 3;
+}
+
+message RevokeSessionRequest {
+  string session_token = 1;
+}
+
+message RevokeSessionResponse {}
+
+message RevokeAllSessionsRequest {
+  string caller_session_token = 1;
+}
+
+message RevokeAllSessionsResponse {
+  int32 sessions_revoked = 1;
+}
+
+message ListActiveSessionsRequest {
+  string caller_session_token = 1;
+}
+
+message ListActiveSessionsResponse {
+  repeated SessionSummary sessions = 1;
+}
+
+message ExportSessionsRequest {
+  string caller_session_token = 1;
+}
+
+message ExportSessionsResponse {
+  // session_token is deliberately never included (charter §3) — a live
+  // bearer credential is not archival user data.
+  bytes export_blob = 1;
+  string format_version = 2;
+}

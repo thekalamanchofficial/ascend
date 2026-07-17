@@ -7,7 +7,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 fail=0
 
-capability_dirs=$(find services/api/internal services/ai/capabilities -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+capability_dirs=$(find services/api/internal services/ai/capabilities apps/mobile/src/capabilities -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
 
 for dir in $capability_dirs; do
   manifest="$dir/DATA_MANIFEST.md"

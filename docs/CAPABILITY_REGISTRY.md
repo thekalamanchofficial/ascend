@@ -14,8 +14,9 @@ Each capability gets one row here and one charter at `docs/capabilities/<capabil
 | Identity | `stable` | capability-engineer | [charter](capabilities/identity.charter.md) | Cryptography & Keys, Audit / Explainability | Permissions, File Objects |
 | Permissions | `stable` | capability-engineer | [charter](capabilities/permissions.charter.md) | Identity, Audit / Explainability | Storage, File Objects |
 | Audit / Explainability | `stable` | capability-engineer | [charter](capabilities/audit-explainability.charter.md) | Identity, Permissions | Identity, Cryptography & Keys, Permissions, Storage, File Objects |
-| Storage | `gated` | capability-engineer (to spawn) | [charter](capabilities/storage.charter.md) | Cryptography & Keys, Permissions, Audit / Explainability | File Objects |
+| Storage | `stable` | capability-engineer | [charter](capabilities/storage.charter.md) | Cryptography & Keys, Permissions, Audit / Explainability | File Objects |
 | File Objects | `gated` | capability-engineer (to spawn) | [charter](capabilities/file-objects.charter.md) | Storage, Permissions, Identity, Cryptography & Keys, Audit / Explainability | (features, once chartered) |
+| Session / Request Authentication | `stable` | capability-engineer | [charter](capabilities/session-authentication.charter.md) | Cryptography & Keys, Identity, Audit / Explainability | Identity, Permissions, Audit / Explainability (as the caller-identity verification layer in front of each) |
 
 **Status values:** `proposed` → `chartering` → `gated` (passed guardian review) → `frozen` (interface contracts locked) → `building` → `stable` → `deprecated`.
 
