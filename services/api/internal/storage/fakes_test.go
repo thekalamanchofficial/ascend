@@ -14,6 +14,10 @@ type fakePermissionChecker struct {
 	calls            []permCall
 	definePolicyErr  error
 	definePolicyCall []policyCall
+	grantErr         error
+	grantCalls       []grantCall
+	revokeErr        error
+	revokeCalls      []revokeCall
 }
 
 type permCall struct {
@@ -22,6 +26,14 @@ type permCall struct {
 
 type policyCall struct {
 	resourceType, defaultRules string
+}
+
+type grantCall struct {
+	grantor, subject, action, resourceType, resourceID, scope string
+}
+
+type revokeCall struct {
+	grantor, subject, action, resourceType, resourceID string
 }
 
 func newFakePermissionChecker(allow bool) *fakePermissionChecker {
@@ -48,6 +60,31 @@ func (f *fakePermissionChecker) DefinePolicy(resourceType, defaultRules string) 
 	defer f.mu.Unlock()
 	f.definePolicyCall = append(f.definePolicyCall, policyCall{resourceType, defaultRules})
 	return f.definePolicyErr
+}
+
+// GrantPermission records the call (so tests can assert StoreBlob
+// establishes the owner grant, and with what shape) and, unless grantErr is
+// set, always succeeds. This fake does not model Permissions' real
+// bootstrap-owner/CheckPermission interaction at all — it is deliberately
+// as simplistic as this fake's existing allow/deny CheckPermission (see the
+// package-level doc comment on realisticPermissionChecker in
+// permissions_integration_test.go for why a from-scratch, real-rule
+// reimplementation lives there instead, not here).
+func (f *fakePermissionChecker) GrantPermission(grantor, subject, action, resourceType, resourceID, scope string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.grantCalls = append(f.grantCalls, grantCall{grantor, subject, action, resourceType, resourceID, scope})
+	return f.grantErr
+}
+
+// RevokePermission records the call (so tests can assert StoreBlob's
+// audit-failure rollback path revokes the grant it just made) and, unless
+// revokeErr is set, always succeeds.
+func (f *fakePermissionChecker) RevokePermission(grantor, subject, action, resourceType, resourceID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokeCalls = append(f.revokeCalls, revokeCall{grantor, subject, action, resourceType, resourceID})
+	return f.revokeErr
 }
 
 // --- fakeAuditEmitter: a controllable AuditEmitter fake that records

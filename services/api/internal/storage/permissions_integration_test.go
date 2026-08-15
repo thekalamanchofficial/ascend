@@ -104,6 +104,55 @@ func (c *realisticPermissionChecker) DefinePolicy(resourceType, _ string) error 
 	return nil
 }
 
+// GrantPermission is a from-scratch reimplementation of the real
+// bootstrap-owner rule permissions.Service.authorizeGrant applies
+// (services/api/internal/permissions/service.go): a resource with no
+// recorded owner yet grants ownership to the FIRST grantor to call
+// GrantPermission on it, regardless of what action/scope they named,
+// exactly mirroring authorizeGrant's `if _, hasOwner :=
+// s.store.ownerOf(req.Resource); !hasOwner { return true, "bootstrap_owner"
+// }` branch. Once a resource has a recorded owner, only that owner (or an
+// existing sufficiently-scoped grant holder — not modeled here, this
+// package's tests never exercise delegated re-granting) may grant further
+// access; a non-owner grantor is denied, matching authorizeGrant's
+// "insufficient_privilege" branch. This is what makes
+// TestNewFilesystemService_RegistersBlobPolicyAgainstRealisticPermissions
+// below a faithful proof that StoreBlob's own GrantPermission call is what
+// establishes ownership, not a simulation of it (see establishOwner's own
+// doc comment above, which remains a plain test-setup helper for the
+// GetStorageLocation/service_test.go gating tests that still use it).
+func (c *realisticPermissionChecker) GrantPermission(grantor, subject, action, resourceType, resourceID, scope string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := resourceKey(resourceType, resourceID)
+	if owner, hasOwner := c.owners[key]; hasOwner && owner != grantor {
+		return errors.New("realisticPermissionChecker: permission denied: grantor does not hold sufficient privilege to grant this action/scope")
+	}
+	if _, hasOwner := c.owners[key]; !hasOwner {
+		c.owners[key] = grantor
+	}
+	if c.grants[key] == nil {
+		c.grants[key] = make(map[string]bool)
+	}
+	c.grants[key][action+"\x1f"+subject] = true
+	return nil
+}
+
+// RevokePermission removes a single active grant (subject/action/resource),
+// mirroring permissions.Service.RevokePermission's effect on the grant
+// store closely enough for this package's rollback tests — it does not
+// reimplement authorizeRevoke's own privilege check, since nothing in this
+// package's tests needs a denied-revoke case.
+func (c *realisticPermissionChecker) RevokePermission(_, subject, action, resourceType, resourceID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := resourceKey(resourceType, resourceID)
+	if c.grants[key] != nil {
+		delete(c.grants[key], action+"\x1f"+subject)
+	}
+	return nil
+}
+
 // TestRealisticPermissionChecker_FailsClosedBeforeBlobPolicyRegistered
 // proves the gap as it existed before this fix: with resourceTypeBlob
 // never registered, CheckPermission denies even a subject who is already
@@ -125,12 +174,20 @@ func TestRealisticPermissionChecker_FailsClosedBeforeBlobPolicyRegistered(t *tes
 // TestNewFilesystemService_RegistersBlobPolicyAgainstRealisticPermissions
 // is the end-to-end proof required by this task: construct Storage's real,
 // production-shaped constructor against a PermissionChecker that has NOT
-// had "blob" pre-registered, confirm construction registers it, and
-// confirm a subsequent CheckPermission-gated call (RetrieveBlob, by the
-// blob's owner) now succeeds where — per the preceding test — it would
-// previously have failed closed. A non-owner, non-granted subject remains
-// correctly denied, proving the fix only registers the policy and does
-// not loosen what's allowed once registered.
+// had "blob" pre-registered, confirm construction registers it, and confirm
+// StoreBlob ALONE — via its own real GrantPermission call, service.go,
+// with no test-only ownership simulation of any kind — establishes
+// "identity:alice" as the new blob's Permissions owner, such that a
+// subsequent CheckPermission-gated call (RetrieveBlob, by the blob's
+// owner) now succeeds where — per the preceding test — it would previously
+// have failed closed forever (StoreBlob never called GrantPermission at
+// all). A non-owner, non-granted subject remains correctly denied, proving
+// the fix only establishes ownership for the true owner and does not
+// loosen what's allowed for anyone else. This is the proof that closes the
+// actual gap described in docs/DECISION_LOG.md, "Storage: StoreBlob
+// establishes Permissions ownership via GrantPermission" — not a
+// simulation of it: this test deliberately does NOT call
+// checker.establishOwner anywhere.
 func TestNewFilesystemService_RegistersBlobPolicyAgainstRealisticPermissions(t *testing.T) {
 	checker := newRealisticPermissionChecker()
 
@@ -154,10 +211,9 @@ func TestNewFilesystemService_RegistersBlobPolicyAgainstRealisticPermissions(t *
 		_ = os.RemoveAll(DefaultDataDir(PolicyLocalSecondary))
 	})
 
-	// Confirm registration actually happened by exercising a real gated
-	// call end to end: store a blob, establish the requesting subject as
-	// its owner (the same bootstrap-owner mechanism Permissions itself
-	// uses), then retrieve it.
+	// Confirm registration actually happened AND that StoreBlob itself — not
+	// this test — establishes ownership: store a blob, then retrieve it as
+	// the owner with no ownership simulation in between.
 	stored, err := svc.StoreBlob(StoreBlobRequest{
 		Owner:    "identity:alice",
 		Data:     []byte("real permissions-shaped wiring"),
@@ -166,11 +222,10 @@ func TestNewFilesystemService_RegistersBlobPolicyAgainstRealisticPermissions(t *
 	if err != nil {
 		t.Fatalf("StoreBlob: %v", err)
 	}
-	checker.establishOwner("identity:alice", resourceTypeBlob, stored.BlobRef)
 
 	got, err := svc.RetrieveBlob(RetrieveBlobRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:alice"})
 	if err != nil {
-		t.Fatalf("RetrieveBlob by the blob's owner: %v (this is exactly the call that would have failed closed before the fix)", err)
+		t.Fatalf("RetrieveBlob by the blob's owner: %v (this is exactly the call that would have failed closed forever before this fix — StoreBlob never established ownership at all)", err)
 	}
 	if string(got.Data) != "real permissions-shaped wiring" {
 		t.Fatalf("got %q, want %q", got.Data, "real permissions-shaped wiring")

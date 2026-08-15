@@ -26,7 +26,7 @@ func newTestService(t *testing.T, allowPerm bool) (*Service, *fakeAuditEmitter, 
 // --- StoreBlob ---
 
 func TestStoreBlob_Success(t *testing.T) {
-	svc, audit, _, backendA, _ := newTestService(t, true)
+	svc, audit, checker, backendA, _ := newTestService(t, true)
 
 	resp, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("opaque ciphertext"), PolicyID: "policy-a"})
 	if err != nil {
@@ -41,6 +41,55 @@ func TestStoreBlob_Success(t *testing.T) {
 	last, ok := audit.lastCall()
 	if !ok || last.action != "storage.store_blob" {
 		t.Fatalf("expected a storage.store_blob audit event, got %+v (ok=%v)", last, ok)
+	}
+
+	// The gap this task closes: StoreBlob must call GrantPermission to
+	// bootstrap the blob's owner (see docs/DECISION_LOG.md, "Storage:
+	// StoreBlob establishes Permissions ownership via GrantPermission").
+	checker.mu.Lock()
+	grantCalls := checker.grantCalls
+	checker.mu.Unlock()
+	if len(grantCalls) != 1 {
+		t.Fatalf("expected exactly one GrantPermission call, got %d: %+v", len(grantCalls), grantCalls)
+	}
+	got := grantCalls[0]
+	want := grantCall{
+		grantor: "identity:alice", subject: "identity:alice",
+		action: ActionRetrieveBlob, resourceType: resourceTypeBlob, resourceID: resp.BlobRef,
+		scope: scopeOwnerBootstrap,
+	}
+	if got != want {
+		t.Fatalf("GrantPermission call = %+v, want %+v", got, want)
+	}
+}
+
+// TestStoreBlob_GrantPermissionFailureRollsBack proves that when
+// establishing the blob's owner grant fails, StoreBlob rolls the write
+// back rather than leaving an unreachable, ungoverned blob whose true
+// owner can never be established (the actual gap this task closes — see
+// docs/DECISION_LOG.md).
+func TestStoreBlob_GrantPermissionFailureRollsBack(t *testing.T) {
+	backendA := newFakeBackend(true, "fake-a")
+	checker := newFakePermissionChecker(true)
+	checker.grantErr = errors.New("fake: grant failed")
+	audit := newFakeAuditEmitter()
+
+	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	_, err = svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("data"), PolicyID: "policy-a"})
+	if err == nil {
+		t.Fatalf("expected StoreBlob to fail when establishing the owner grant fails")
+	}
+	if len(backendA.data) != 0 {
+		t.Fatalf("expected the backend write to be rolled back, but backend still holds %d entries", len(backendA.data))
+	}
+	// The audit emit must never be reached — the mutation never
+	// meaningfully happened from the caller's point of view.
+	if audit.callCount() != 0 {
+		t.Fatalf("expected no audit emit when the owner grant fails, got %d calls", audit.callCount())
 	}
 }
 
@@ -82,6 +131,24 @@ func TestStoreBlob_AuditFailureRollsBack(t *testing.T) {
 
 	if len(backendA.data) != 0 {
 		t.Fatalf("expected the backend write to be rolled back, but backend still holds %d entries", len(backendA.data))
+	}
+
+	// The owner grant established just before the failed audit emit must
+	// also be revoked — otherwise a rolled-back blob_ref (never returned to
+	// any caller) would leave a live, orphaned Permissions grant behind,
+	// against this package's "no dual-copy/no orphaned grant" discipline.
+	checker.mu.Lock()
+	grantCalls, revokeCalls := checker.grantCalls, checker.revokeCalls
+	checker.mu.Unlock()
+	if len(grantCalls) != 1 {
+		t.Fatalf("expected exactly one GrantPermission call before the audit emit failed, got %d", len(grantCalls))
+	}
+	if len(revokeCalls) != 1 {
+		t.Fatalf("expected exactly one RevokePermission call rolling back the grant, got %d", len(revokeCalls))
+	}
+	g, r := grantCalls[0], revokeCalls[0]
+	if r != (revokeCall{grantor: g.grantor, subject: g.subject, action: g.action, resourceType: g.resourceType, resourceID: g.resourceID}) {
+		t.Fatalf("RevokePermission call %+v does not match the earlier GrantPermission call %+v", r, g)
 	}
 }
 

@@ -154,6 +154,34 @@ func (s *Service) StoreBlob(req StoreBlobRequest) (StoreBlobResponse, error) {
 		"size_bytes": strconv.FormatInt(record.SizeBytes, 10),
 	}
 
+	// Bootstrap the blob's Permissions owner (mirrors File Objects'
+	// CreateFileObject pattern exactly, services/api/internal/fileobjects/
+	// service.go). This is the resource's first-ever grant on ("blob",
+	// blob_ref) — Permissions' own bootstrap-owner rule
+	// (permissions.Service.authorizeGrant) makes req.Owner the blob's
+	// recorded owner as a result. Without this call, a bare Storage caller
+	// could never retrieve/move/delete a blob they themselves stored:
+	// CheckPermission's owner check has nothing to match against, and
+	// nothing else in this package ever calls GrantPermission. Ownership is
+	// action-independent once established (Permissions' ownerOf check does
+	// not look at which action a grant named), so this single
+	// ActionRetrieveBlob grant is sufficient to also satisfy
+	// RetrieveBlob/MoveBlob/DeleteBlob's own, separately-actioned
+	// CheckPermission calls later — no need for three separate bootstrap
+	// grants here. See docs/DECISION_LOG.md, "Storage: StoreBlob
+	// establishes Permissions ownership via GrantPermission".
+	//
+	// blob_ref is the ONLY handle req.Owner will ever receive to this
+	// blob — same reachability hazard as the audit-emit rollback below — so
+	// a failed grant rolls the write back rather than leaving a blob
+	// nobody, not even its owner, can ever reach again.
+	if err := s.checker.GrantPermission(req.Owner, req.Owner, ActionRetrieveBlob, resourceTypeBlob, blobRef, scopeOwnerBootstrap); err != nil {
+		_ = policy.Backend.Delete(blobRef)
+		s.store.delete(blobRef)
+		s.store.destroyWrappingKey(blobRef)
+		return StoreBlobResponse{}, fmt.Errorf("storage: store rolled back, establishing owner grant failed: %w", err)
+	}
+
 	// blob_ref is the ONLY handle req.Owner will ever receive to this
 	// data — unlike Permissions'/Identity's own "audit failed after a
 	// mutation already landed" precedent (where the caller already knows
@@ -163,10 +191,26 @@ func (s *Service) StoreBlob(req StoreBlobRequest) (StoreBlobResponse, error) {
 	// the cases that precedent tolerates. So StoreBlob rolls the write
 	// back rather than reporting success (or a "succeeded but unaudited"
 	// partial state) when the audit emit fails. See docs/DECISION_LOG.md.
+	//
+	// The owner grant established just above must also be undone here —
+	// otherwise a rolled-back (never-existed, from the caller's point of
+	// view) blob_ref would still hold a live, orphaned Permissions grant,
+	// which is exactly the "no dual-copy/no orphaned grant" discipline this
+	// package already holds itself to elsewhere (MoveBlob's rollback,
+	// DeleteBlob's tombstone discipline). RevokePermission's error is
+	// deliberately discarded (best-effort): the store/backend rollback
+	// already returns the operation's real, more informative error below,
+	// and an orphaned grant on an unreachable blob_ref (one that was never
+	// returned to any caller and matches no BlobRecord) is inert — nothing
+	// in this package or Permissions' own CheckPermission can ever be asked
+	// about it again, so failing to clean it up is a harmless leak, not a
+	// silent-success hazard, and must not shadow the real error being
+	// returned.
 	if _, err := s.audit.Emit(req.Owner, "storage.store_blob", resource, "owner_requested_store", metadata); err != nil {
 		_ = policy.Backend.Delete(blobRef)
 		s.store.delete(blobRef)
 		s.store.destroyWrappingKey(blobRef)
+		_ = s.checker.RevokePermission(req.Owner, req.Owner, ActionRetrieveBlob, resourceTypeBlob, blobRef)
 		return StoreBlobResponse{}, fmt.Errorf("storage: store rolled back, audit emit failed: %w", err)
 	}
 

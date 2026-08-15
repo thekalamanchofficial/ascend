@@ -67,6 +67,27 @@ type ResourceRef struct {
 type PermissionChecker interface {
 	CheckPermission(subject, action string, resourceType, resourceID string) (bool, error)
 	DefinePolicy(resourceType, defaultRules string) error
+	// GrantPermission bootstraps a blob's Permissions owner. This is NOT a
+	// general delegation feature Storage exposes to callers (Storage has no
+	// RPC that shares a blob with another subject) — it exists solely so
+	// StoreBlob can make the resource's first-ever grant on ("blob",
+	// blob_ref), which Permissions' own bootstrap-owner rule
+	// (permissions.Service.authorizeGrant) turns into that subject becoming
+	// the blob's recorded owner. Without this, CheckPermission would deny
+	// every action, including to a blob's true owner, forever (see
+	// docs/DECISION_LOG.md, "Storage: StoreBlob establishes Permissions
+	// ownership via GrantPermission"). Mirrors File Objects' own
+	// PermissionsClient.GrantPermission exactly
+	// (services/api/internal/fileobjects/types.go) — same signature, same
+	// bootstrap-only purpose.
+	GrantPermission(grantor, subject, action, resourceType, resourceID, scope string) error
+	// RevokePermission undoes a GrantPermission call made moments earlier in
+	// the same request, used only for StoreBlob's own rollback when the
+	// grant succeeded but the subsequent audit emit then failed (see
+	// service.go's StoreBlob). Storage never revokes a grant it did not
+	// itself just create. Mirrors File Objects'
+	// PermissionsClient.RevokePermission exactly (same signature).
+	RevokePermission(grantor, subject, action, resourceType, resourceID string) error
 }
 
 // AuditEmitter is the local interface this package depends on instead of
@@ -102,6 +123,19 @@ const (
 // mechanism) always has access, and explicit grants extend access beyond
 // the owner.
 const blobDefaultRules = "deny_by_default_owner_and_explicit_grant_only"
+
+// scopeOwnerBootstrap is the scope StoreBlob passes to its one
+// GrantPermission call establishing the blob's owner (service.go). "full"
+// is Permissions' own top of its known scope ordering short of "owner"
+// (permissions/scope.go's scopeRank) and is the same literal value File
+// Objects uses for its equivalent bootstrap grants (fileobjects'
+// scopeFull) — chosen for consistency, not because the value is
+// load-bearing here: ownership itself comes from this being the
+// resource's first-ever grant (Permissions' bootstrap-owner rule), not
+// from the scope string, and Permissions' owner check
+// (Store.ownerOf/CheckPermission) is action- and scope-independent once a
+// resource has a recorded owner.
+const scopeOwnerBootstrap = "full"
 
 // --- Deletion-mechanism values (Art. 15 — must be inspectable, never a
 // hidden implementation detail). See docs/DECISION_LOG.md, 2026-07-17

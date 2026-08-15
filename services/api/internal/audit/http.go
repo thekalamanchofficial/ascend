@@ -36,13 +36,18 @@ const callerHeader = "X-Ascend-Actor"
 //	GET    /v1/audit/events/{eventID}/explain  Explain
 //	GET    /v1/audit/export                    ExportAuditTrail (query param: identity_ref)
 //
-// Every route (except none — all four require a caller identity) reads the
-// caller's identity from the X-Ascend-Actor header; Emit uses the request
-// body's own `actor` field for the emitted event's actor (that is the
-// subject of the mutation being recorded, not necessarily the network
-// caller — e.g. a backend service emitting on behalf of a user), but still
-// requires the header to be present as a minimal "who is calling this
-// endpoint at all" guard.
+// Every route (all four) requires a caller identity, read from the
+// X-Ascend-Actor header. Emit's request body also carries its own `actor`
+// field — the subject of the mutation being recorded — which for
+// privileged in-process Go callers (calling `audit.Emit` directly, never
+// through this HTTP path) may legitimately differ from the calling
+// principal (e.g. a backend service emitting on behalf of a user). Over
+// this network-reachable HTTP surface, however, the caller is an arbitrary
+// authenticated client, so handleEmit additionally requires the body's
+// `actor` to equal the X-Ascend-Actor caller identity — otherwise a
+// caller could name any actor and forge audit entries attributed to
+// someone else. Query, Explain, and Export use the header value directly
+// as the caller identity with no separate body field to check.
 func Mount(r chi.Router, svc *Service) {
 	r.Route("/v1/audit", func(r chi.Router) {
 		r.Post("/events", handleEmit(svc))
@@ -66,13 +71,26 @@ type emitResponseDTO struct {
 
 func handleEmit(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(callerHeader) == "" {
+		caller := r.Header.Get(callerHeader)
+		if caller == "" {
 			writeError(w, http.StatusUnauthorized, ErrMissingCaller)
 			return
 		}
 		var req emitRequestDTO
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		// The body's actor field names the subject of the emitted event,
+		// which is allowed to differ from the network caller for
+		// privileged in-process Go callers (see Mount's doc comment) —
+		// but over the network, an arbitrary authenticated caller must
+		// not be able to name a different actor and forge audit entries
+		// attributed to someone else. Once real session/token auth
+		// (Identity-owned) replaces callerHeader with a verified claim,
+		// this check continues to hold unchanged.
+		if req.Actor != caller {
+			writeError(w, http.StatusForbidden, ErrPermissionDenied)
 			return
 		}
 		eventID, err := svc.Emit(req.Actor, req.Action, req.Resource, req.RuleReference, req.Metadata)

@@ -109,6 +109,76 @@ func TestHTTP_EmitThenQueryThenExplainThenExport(t *testing.T) {
 	}
 }
 
+func TestHTTP_EmitActorMismatchRejected(t *testing.T) {
+	svc := NewService(NewInMemoryStore(), nil)
+	ts := newTestServer(svc)
+	defer ts.Close()
+
+	// Caller is identity:bob (verified via X-Ascend-Actor), but the body
+	// names identity:alice as the event's actor — must be rejected so a
+	// caller cannot forge audit entries attributed to another identity.
+	emitBody, _ := json.Marshal(emitRequestDTO{
+		Actor:    "identity:alice",
+		Action:   "crypto.key_pair_generated",
+		Resource: ResourceRef{ResourceType: "key", ResourceID: "identity-key"},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/audit/events", bytes.NewReader(emitBody))
+	req.Header.Set(callerHeader, "identity:bob")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("emit request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for actor/caller mismatch, got %d", resp.StatusCode)
+	}
+
+	// No event should have been recorded.
+	qReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/audit/events?subject=identity:alice", nil)
+	qReq.Header.Set(callerHeader, "identity:alice")
+	qResp, err := http.DefaultClient.Do(qReq)
+	if err != nil {
+		t.Fatalf("query request: %v", err)
+	}
+	defer qResp.Body.Close()
+	var qBody queryResponseDTO
+	if err := json.NewDecoder(qResp.Body).Decode(&qBody); err != nil {
+		t.Fatalf("decode query response: %v", err)
+	}
+	if len(qBody.Events) != 0 {
+		t.Fatalf("expected no events recorded after rejected emit, got %d", len(qBody.Events))
+	}
+}
+
+func TestHTTP_EmitActorMatchesCallerSucceeds(t *testing.T) {
+	svc := NewService(NewInMemoryStore(), nil)
+	ts := newTestServer(svc)
+	defer ts.Close()
+
+	emitBody, _ := json.Marshal(emitRequestDTO{
+		Actor:    "identity:alice",
+		Action:   "crypto.key_pair_generated",
+		Resource: ResourceRef{ResourceType: "key", ResourceID: "identity-key"},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/audit/events", bytes.NewReader(emitBody))
+	req.Header.Set(callerHeader, "identity:alice")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("emit request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 when body actor matches caller, got %d", resp.StatusCode)
+	}
+	var emitResp emitResponseDTO
+	if err := json.NewDecoder(resp.Body).Decode(&emitResp); err != nil {
+		t.Fatalf("decode emit response: %v", err)
+	}
+	if emitResp.EventID == "" {
+		t.Fatal("expected non-empty event_id")
+	}
+}
+
 func TestHTTP_MissingCallerHeaderRejected(t *testing.T) {
 	svc := NewService(NewInMemoryStore(), nil)
 	ts := newTestServer(svc)
