@@ -8,14 +8,20 @@ import (
 // --- fakePermissionChecker: a controllable PermissionChecker fake. ---
 
 type fakePermissionChecker struct {
-	mu    sync.Mutex
-	allow bool
-	err   error
-	calls []permCall
+	mu               sync.Mutex
+	allow            bool
+	err              error
+	calls            []permCall
+	definePolicyErr  error
+	definePolicyCall []policyCall
 }
 
 type permCall struct {
 	subject, action, resourceType, resourceID string
+}
+
+type policyCall struct {
+	resourceType, defaultRules string
 }
 
 func newFakePermissionChecker(allow bool) *fakePermissionChecker {
@@ -30,6 +36,18 @@ func (f *fakePermissionChecker) CheckPermission(subject, action, resourceType, r
 		return false, f.err
 	}
 	return f.allow, nil
+}
+
+// DefinePolicy records the call (so tests can assert NewService registers
+// resourceTypeBlob's policy at construction) and, unless definePolicyErr
+// is set, always succeeds — mirroring the real Permissions.DefinePolicy's
+// plain-map-write, no-error-on-redefinition semantics (store.go's
+// setPolicy).
+func (f *fakePermissionChecker) DefinePolicy(resourceType, defaultRules string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.definePolicyCall = append(f.definePolicyCall, policyCall{resourceType, defaultRules})
+	return f.definePolicyErr
 }
 
 // --- fakeAuditEmitter: a controllable AuditEmitter fake that records
@@ -94,6 +112,16 @@ type fakeBackend struct {
 	failRetrieve   bool
 	failDelete     bool
 	locationPrefix string
+	// deleteCalls/storeCalls count real Backend.Delete/Store invocations —
+	// used by the DeleteBlob/MoveBlob concurrency-hardening tests
+	// (service_concurrency_test.go) to prove the underlying backend
+	// mechanism only ever runs once per genuine relocation/deletion, even
+	// under concurrent duplicate requests, rather than merely inferring
+	// that from the final map state (which, for this in-memory fake,
+	// would stay correct even under a double-call race a real backend
+	// might not tolerate as gracefully).
+	deleteCalls int
+	storeCalls  int
 }
 
 func newFakeBackend(physicalDelete bool, locationPrefix string) *fakeBackend {
@@ -103,6 +131,7 @@ func newFakeBackend(physicalDelete bool, locationPrefix string) *fakeBackend {
 func (b *fakeBackend) Store(key string, data []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.storeCalls++
 	if b.failStore {
 		return errors.New("fake backend: store failed")
 	}
@@ -130,6 +159,7 @@ func (b *fakeBackend) Retrieve(key string) ([]byte, error) {
 func (b *fakeBackend) Delete(key string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.deleteCalls++
 	if b.failDelete {
 		return errors.New("fake backend: delete failed")
 	}
@@ -163,6 +193,21 @@ func (b *fakeBackend) has(key string) bool {
 	defer b.mu.Unlock()
 	_, ok := b.data[key]
 	return ok
+}
+
+// deleteCallCount/storeCallCount are locked accessors for the counters
+// above — safe to call from a test goroutine concurrently with the
+// backend still being exercised by other goroutines.
+func (b *fakeBackend) deleteCallCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.deleteCalls
+}
+
+func (b *fakeBackend) storeCallCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.storeCalls
 }
 
 func (b *fakeBackend) rawBytes(key string) ([]byte, bool) {

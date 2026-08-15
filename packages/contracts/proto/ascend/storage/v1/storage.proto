@@ -102,6 +102,12 @@ message DeleteBlobResponse {}
 
 message GetStorageLocationRequest {
   string blob_ref = 1;
+  // Added 2026-07-17 (docs/DECISION_LOG.md, "Storage passes merge gate" —
+  // this field was missing from the original freeze). Gated on the same
+  // ActionRetrieveBlob permission as RetrieveBlob itself: if a subject can
+  // read a blob's content, they may also learn where it lives; there is no
+  // separate, narrower "location" grant.
+  string requesting_subject = 2;
 }
 
 message GetStorageLocationResponse {
@@ -116,6 +122,14 @@ message ListStoragePoliciesResponse {
 
 message ExportAllBlobsRequest {
   string owner = 1;
+  // Added 2026-07-17 (docs/DECISION_LOG.md, "Storage passes merge gate" —
+  // this field was missing from the original freeze). Unlike the
+  // per-blob RPCs, this is not CheckPermission-gated per blob: a bulk
+  // export of everything an owner has ever stored is a right-to-leave
+  // operation (Art. 9), not a shareable read — it must be requested by
+  // the owner themselves. Reject unless requesting_subject == owner; no
+  // delegated or collaborator-initiated bulk export exists.
+  string requesting_subject = 2;
 }
 
 message ExportAllBlobsResponse {

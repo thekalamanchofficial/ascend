@@ -56,8 +56,17 @@ type ResourceRef struct {
 // below, mirroring how Permissions' own resource_type/action fields are
 // free-form strings each owning capability defines (see
 // internal/permissions/types.go's ResourceRef doc comment).
+//
+// DefinePolicy registers resourceType's default policy with Permissions.
+// Storage needs this (not just CheckPermission) because Permissions'
+// CheckPermission fails closed for any resource_type that has never had
+// DefinePolicy called for it — see NewService's call to this method for
+// "blob", and docs/DECISION_LOG.md, "Storage: register 'blob' Permissions
+// policy at construction (closing a real fail-closed gap)", for the gap
+// this closes.
 type PermissionChecker interface {
 	CheckPermission(subject, action string, resourceType, resourceID string) (bool, error)
+	DefinePolicy(resourceType, defaultRules string) error
 }
 
 // AuditEmitter is the local interface this package depends on instead of
@@ -80,6 +89,19 @@ const (
 
 	resourceTypeBlob = "blob"
 )
+
+// blobDefaultRules is the free-form default_rules string Storage registers
+// for resourceTypeBlob via PermissionChecker.DefinePolicy at construction
+// (see NewService). Permissions' own DefinePolicy does not parse or
+// evaluate this string in this implementation wave (see
+// docs/DECISION_LOG.md, Permissions' "default_rules representation" entry)
+// — it exists purely as inspectable documentation of intent, recorded in
+// Permissions' own policy record. The actual enforcement is
+// CheckPermission's existing, unchanged owner/grant logic: deny by
+// default, the resource's owner (via Permissions' bootstrap-owner
+// mechanism) always has access, and explicit grants extend access beyond
+// the owner.
+const blobDefaultRules = "deny_by_default_owner_and_explicit_grant_only"
 
 // --- Deletion-mechanism values (Art. 15 — must be inspectable, never a
 // hidden implementation detail). See docs/DECISION_LOG.md, 2026-07-17
@@ -179,6 +201,13 @@ type DeleteBlobResponse struct{}
 
 type GetStorageLocationRequest struct {
 	BlobRef string
+	// RequestingSubject added 2026-07-17 (storage.proto amendment, Chief
+	// Architect — closing the frozen-contract gap flagged at this
+	// capability's merge gate). Gated on the same PermissionChecker action
+	// as RetrieveBlob (ActionRetrieveBlob): if a subject can read a blob's
+	// content, they may also learn where it lives — there is no separate,
+	// narrower "location" grant. See GetStorageLocation's doc comment.
+	RequestingSubject string
 }
 
 type GetStorageLocationResponse struct {
@@ -193,6 +222,16 @@ type ListStoragePoliciesResponse struct {
 
 type ExportAllBlobsRequest struct {
 	Owner string
+	// RequestingSubject added 2026-07-17 (storage.proto amendment, Chief
+	// Architect — closing the frozen-contract gap flagged at this
+	// capability's merge gate). Deliberately NOT CheckPermission-gated per
+	// blob: ExportAllBlobs is rejected outright unless RequestingSubject
+	// == Owner. A bulk export of everything an owner has ever stored is a
+	// right-to-leave operation (Art. 9), not a shareable read — a
+	// collaborator holding a valid per-blob grant on every one of the
+	// owner's blobs must still not be able to use this RPC to obtain them
+	// in bulk. See ExportAllBlobs's doc comment (export.go).
+	RequestingSubject string
 }
 
 type ExportAllBlobsResponse struct {

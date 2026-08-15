@@ -60,9 +60,28 @@ type exportDocument struct {
 // disclosure of a user's entire blob inventory is exactly the kind of
 // sensitive, important action Art. 5 requires stay discoverable, matching
 // Permissions' ExportPermissions/Identity's ExportIdentity precedent.
+//
+// GATING (charter §3, docs/DECISION_LOG.md "Storage follow-ups...",
+// 2026-07-17): deliberately NOT CheckPermission-gated per blob. Bulk
+// export of everything an owner has ever stored is a right-to-leave
+// operation (Art. 9), not a shareable read, so this is rejected outright
+// unless req.RequestingSubject == req.Owner — stricter than a grant-based
+// check. A collaborator holding a valid per-blob storage.retrieve_blob
+// grant on every one of the owner's blobs must still not be able to use
+// this RPC to obtain them in bulk; they remain limited to retrieving each
+// blob individually, one CheckPermission-gated RetrieveBlob call at a
+// time.
 func (s *Service) ExportAllBlobs(req ExportAllBlobsRequest) (ExportAllBlobsResponse, error) {
 	if req.Owner == "" {
 		return ExportAllBlobsResponse{}, fmt.Errorf("%w: owner is required", ErrInvalidArgument)
+	}
+	if req.RequestingSubject == "" {
+		return ExportAllBlobsResponse{}, fmt.Errorf("%w: requesting_subject is required", ErrInvalidArgument)
+	}
+	if req.RequestingSubject != req.Owner {
+		resource := ResourceRef{ResourceType: "storage_export", ResourceID: req.Owner}
+		_, _ = s.audit.Emit(req.RequestingSubject, "storage.export_all_blobs_denied", resource, "not_owner", nil)
+		return ExportAllBlobsResponse{}, ErrPermissionDenied
 	}
 
 	records := s.store.recordsForOwner(req.Owner)

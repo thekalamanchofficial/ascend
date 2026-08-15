@@ -122,7 +122,10 @@ func handleDeleteBlob(svc *Service) http.HandlerFunc {
 
 func handleGetStorageLocation(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		req := GetStorageLocationRequest{BlobRef: r.URL.Query().Get("blob_ref")}
+		req := GetStorageLocationRequest{
+			BlobRef:           r.URL.Query().Get("blob_ref"),
+			RequestingSubject: r.URL.Query().Get("requesting_subject"),
+		}
 		resp, err := svc.GetStorageLocation(req)
 		if err != nil {
 			writeError(w, statusFor(err), err)
@@ -145,7 +148,10 @@ func handleListStoragePolicies(svc *Service) http.HandlerFunc {
 
 func handleExportAllBlobs(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		req := ExportAllBlobsRequest{Owner: r.URL.Query().Get("owner")}
+		req := ExportAllBlobsRequest{
+			Owner:             r.URL.Query().Get("owner"),
+			RequestingSubject: r.URL.Query().Get("requesting_subject"),
+		}
 		resp, err := svc.ExportAllBlobs(req)
 		if err != nil {
 			writeError(w, statusFor(err), err)

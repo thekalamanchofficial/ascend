@@ -81,7 +81,7 @@ func TestExportAllBlobs_IncludesLiveContentExcludesDeletedContent(t *testing.T) 
 		t.Fatalf("DeleteBlob: %v", err)
 	}
 
-	resp, err := svc.ExportAllBlobs(ExportAllBlobsRequest{Owner: "identity:alice"})
+	resp, err := svc.ExportAllBlobs(ExportAllBlobsRequest{Owner: "identity:alice", RequestingSubject: "identity:alice"})
 	if err != nil {
 		t.Fatalf("ExportAllBlobs: %v", err)
 	}
@@ -140,4 +140,86 @@ func TestExportAllBlobs_EmptyOwnerRejected(t *testing.T) {
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("expected ErrInvalidArgument, got %v", err)
 	}
+}
+
+func TestExportAllBlobs_MissingRequestingSubjectRejected(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t, true)
+	_, err := svc.ExportAllBlobs(ExportAllBlobsRequest{Owner: "identity:alice", RequestingSubject: ""})
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+}
+
+// TestExportAllBlobs_DeniedForNonOwnerEvenWithFullGrantCoverage is the
+// load-bearing proof for the 2026-07-17 gating fix
+// (docs/DECISION_LOG.md, "Storage follow-ups..."): ExportAllBlobs is
+// rejected for anyone other than the exact owner, even a subject who
+// holds a valid, active storage.retrieve_blob grant on EVERY one of the
+// owner's blobs — bulk export specifically requires being the owner;
+// full per-blob grant coverage is not a substitute. Uses an
+// allow-everything PermissionChecker deliberately: if ExportAllBlobs
+// mistakenly delegated to CheckPermission (instead of its own direct
+// owner-equality check), this test would incorrectly pass, so a failure
+// here would prove the implementation regressed to the wrong design.
+// Also asserts CheckPermission is never called at all, proving
+// ExportAllBlobs's own doc-commented claim that it is not
+// CheckPermission-gated per blob.
+func TestExportAllBlobs_DeniedForNonOwnerEvenWithFullGrantCoverage(t *testing.T) {
+	checker := newFakePermissionChecker(true) // allow-everything, on purpose — see doc comment above
+	backend := newFakeBackend(true, "fake")
+	audit := newFakeAuditEmitter()
+	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	var blobRefs []string
+	for i := 0; i < 3; i++ {
+		stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("secret"), PolicyID: "policy-a"})
+		if err != nil {
+			t.Fatalf("StoreBlob: %v", err)
+		}
+		blobRefs = append(blobRefs, stored.BlobRef)
+	}
+	// checker.allow is already true for every subject/action/resource —
+	// this stands in for "bob holds an active storage.retrieve_blob grant
+	// on every one of alice's blobs."
+	_ = blobRefs
+
+	checker.mu.Lock()
+	checker.calls = nil // reset: only StoreBlob calls (none, StoreBlob doesn't check permission) may have landed above
+	checker.mu.Unlock()
+
+	_, err = svc.ExportAllBlobs(ExportAllBlobsRequest{Owner: "identity:alice", RequestingSubject: "identity:bob"})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied for a non-owner subject despite full per-blob grant coverage, got %v", err)
+	}
+
+	checker.mu.Lock()
+	callCount := len(checker.calls)
+	checker.mu.Unlock()
+	if callCount != 0 {
+		t.Fatalf("expected ExportAllBlobs to never call CheckPermission at all (bulk export is owner-only, not per-blob gated), but it was called %d time(s)", callCount)
+	}
+
+	last, ok := audit.lastCall()
+	if !ok || last.action != "storage.export_all_blobs_denied" {
+		t.Fatalf("expected a storage.export_all_blobs_denied audit event, got %+v (ok=%v)", last, ok)
+	}
+}
+
+func TestExportAllBlobs_AllowedForExactOwner(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t, true)
+	stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("x"), PolicyID: "policy-a"})
+	if err != nil {
+		t.Fatalf("StoreBlob: %v", err)
+	}
+	resp, err := svc.ExportAllBlobs(ExportAllBlobsRequest{Owner: "identity:alice", RequestingSubject: "identity:alice"})
+	if err != nil {
+		t.Fatalf("expected the exact owner to be allowed, got %v", err)
+	}
+	if resp.FormatVersion == "" {
+		t.Fatalf("expected a non-empty format_version")
+	}
+	_ = stored
 }

@@ -215,7 +215,7 @@ func TestMoveBlob_AtomicNoDualCopy(t *testing.T) {
 		t.Fatalf("data changed across move: got %q", got.Data)
 	}
 
-	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef})
+	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:alice"})
 	if err != nil {
 		t.Fatalf("GetStorageLocation: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestDeleteBlob_PhysicalDeletePath(t *testing.T) {
 		t.Fatalf("expected RetrieveBlob to fail with ErrBlobNotFound after physical delete, got %v", err)
 	}
 
-	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef})
+	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:alice"})
 	if err != nil {
 		t.Fatalf("GetStorageLocation after delete: %v", err)
 	}
@@ -515,12 +515,151 @@ func TestNewService_RejectsEmptyPolicySet(t *testing.T) {
 	}
 }
 
+// TestNewService_RegistersBlobPolicyOnConstruction proves NewService calls
+// PermissionChecker.DefinePolicy for resourceTypeBlob exactly once, at
+// construction, before returning — this is what stops a real
+// Permissions.CheckPermission from failing closed on "blob" for every
+// gated call this package makes (see docs/DECISION_LOG.md, "Storage:
+// register 'blob' Permissions policy at construction").
+func TestNewService_RegistersBlobPolicyOnConstruction(t *testing.T) {
+	checker := newFakePermissionChecker(true)
+	backend := newFakeBackend(true, "fake")
+	policies := []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}
+
+	if _, err := NewService(policies, checker, newFakeAuditEmitter()); err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	checker.mu.Lock()
+	calls := checker.definePolicyCall
+	checker.mu.Unlock()
+
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one DefinePolicy call, got %d: %+v", len(calls), calls)
+	}
+	if calls[0].resourceType != resourceTypeBlob {
+		t.Fatalf("expected DefinePolicy to register resource type %q, got %q", resourceTypeBlob, calls[0].resourceType)
+	}
+	if calls[0].defaultRules != blobDefaultRules {
+		t.Fatalf("expected DefinePolicy to be called with default_rules %q, got %q", blobDefaultRules, calls[0].defaultRules)
+	}
+}
+
+// TestNewService_PropagatesDefinePolicyFailure proves a failure to
+// register the default policy surfaces as a loud construction-time error
+// rather than a Service that silently proceeds without ever having
+// registered "blob" — the same "fail loudly, not silently" discipline
+// this package applies to every other mutation whose audit emit can fail
+// (DefinePolicy's own audit emit is what could fail here, per
+// permissions.Service.DefinePolicy's doc comment).
+func TestNewService_PropagatesDefinePolicyFailure(t *testing.T) {
+	checker := newFakePermissionChecker(true)
+	checker.definePolicyErr = errors.New("fake: define policy failed")
+	backend := newFakeBackend(true, "fake")
+	policies := []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}
+
+	if _, err := NewService(policies, checker, newFakeAuditEmitter()); err == nil {
+		t.Fatalf("expected NewService to propagate a DefinePolicy failure")
+	}
+}
+
 // --- GetStorageLocation ---
 
 func TestGetStorageLocation_NotFound(t *testing.T) {
 	svc, _, _, _, _ := newTestService(t, true)
-	_, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: "blob_never_existed"})
+	_, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: "blob_never_existed", RequestingSubject: "identity:alice"})
 	if !errors.Is(err, ErrBlobNotFound) {
 		t.Fatalf("expected ErrBlobNotFound, got %v", err)
+	}
+}
+
+func TestGetStorageLocation_MissingRequestingSubjectRejected(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t, true)
+	stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("x"), PolicyID: "policy-a"})
+	if err != nil {
+		t.Fatalf("StoreBlob: %v", err)
+	}
+	_, err = svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef})
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+}
+
+// TestGetStorageLocation_DeniedForNonGrantedSubject/_AllowedForOwner/
+// _AllowedForGrantedSubject use realisticPermissionChecker (not the plain
+// allow/deny fakePermissionChecker) specifically because they need to
+// distinguish owner vs. granted vs. neither for the SAME subject field —
+// a blanket allow/deny fake cannot express that distinction. Proves the
+// 2026-07-17 gating fix (docs/DECISION_LOG.md, "Storage follow-ups...")
+// end to end: GetStorageLocation is gated on the exact same
+// ActionRetrieveBlob action/resource RetrieveBlob itself uses.
+func TestGetStorageLocation_DeniedForNonGrantedSubject(t *testing.T) {
+	checker := newRealisticPermissionChecker()
+	backend := newFakeBackend(true, "fake")
+	audit := newFakeAuditEmitter()
+	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("x"), PolicyID: "policy-a"})
+	if err != nil {
+		t.Fatalf("StoreBlob: %v", err)
+	}
+	checker.establishOwner("identity:alice", resourceTypeBlob, stored.BlobRef)
+
+	_, err = svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:mallory"})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied for a non-owner, non-granted subject, got %v", err)
+	}
+	last, ok := audit.lastCall()
+	if !ok || last.action != "storage.get_storage_location_denied" {
+		t.Fatalf("expected a storage.get_storage_location_denied audit event, got %+v (ok=%v)", last, ok)
+	}
+}
+
+func TestGetStorageLocation_AllowedForOwner(t *testing.T) {
+	checker := newRealisticPermissionChecker()
+	backend := newFakeBackend(true, "fake")
+	audit := newFakeAuditEmitter()
+	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("x"), PolicyID: "policy-a"})
+	if err != nil {
+		t.Fatalf("StoreBlob: %v", err)
+	}
+	checker.establishOwner("identity:alice", resourceTypeBlob, stored.BlobRef)
+
+	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:alice"})
+	if err != nil {
+		t.Fatalf("expected the owner to be allowed, got %v", err)
+	}
+	if loc.HumanReadableLocation == "" {
+		t.Fatalf("expected a non-empty human_readable_location")
+	}
+}
+
+func TestGetStorageLocation_AllowedForGrantedSubject(t *testing.T) {
+	checker := newRealisticPermissionChecker()
+	backend := newFakeBackend(true, "fake")
+	audit := newFakeAuditEmitter()
+	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	stored, err := svc.StoreBlob(StoreBlobRequest{Owner: "identity:alice", Data: []byte("x"), PolicyID: "policy-a"})
+	if err != nil {
+		t.Fatalf("StoreBlob: %v", err)
+	}
+	checker.establishOwner("identity:alice", resourceTypeBlob, stored.BlobRef)
+	checker.grant("identity:bob", ActionRetrieveBlob, resourceTypeBlob, stored.BlobRef)
+
+	loc, err := svc.GetStorageLocation(GetStorageLocationRequest{BlobRef: stored.BlobRef, RequestingSubject: "identity:bob"})
+	if err != nil {
+		t.Fatalf("expected a subject with an active storage.retrieve_blob grant to be allowed, got %v", err)
+	}
+	if loc.HumanReadableLocation == "" {
+		t.Fatalf("expected a non-empty human_readable_location")
 	}
 }

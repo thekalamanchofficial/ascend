@@ -33,6 +33,20 @@ type Service struct {
 // cannot currently honor (charter §5/§6), so an empty or malformed policy
 // set is a construction-time error, not a runtime surprise discovered
 // later via ListStoragePolicies.
+//
+// NewService also registers resourceTypeBlob's default policy with the
+// injected PermissionChecker (checker.DefinePolicy) before returning.
+// Permissions' own CheckPermission fails closed for any resource_type
+// that has never had DefinePolicy called for it — every gated call this
+// package makes (RetrieveBlob/MoveBlob/DeleteBlob) checks resource type
+// "blob", so without this call every one of those would be denied even
+// for a blob's true owner, against a real (non-fake) Permissions
+// instance. Doing this here, once, at construction — rather than lazily
+// on first gated call, or left to whoever wires this Service up — is what
+// makes registration happen exactly once and strictly before any real
+// caller can reach a CheckPermission call. See
+// docs/DECISION_LOG.md, "Storage: register 'blob' Permissions policy at
+// construction (closing a real fail-closed gap)".
 func NewService(policies []Policy, checker PermissionChecker, audit AuditEmitter) (*Service, error) {
 	if len(policies) == 0 {
 		return nil, errors.New("storage: at least one storage policy is required")
@@ -42,6 +56,9 @@ func NewService(policies []Policy, checker PermissionChecker, audit AuditEmitter
 	}
 	if audit == nil {
 		return nil, errors.New("storage: an AuditEmitter is required")
+	}
+	if err := checker.DefinePolicy(resourceTypeBlob, blobDefaultRules); err != nil {
+		return nil, fmt.Errorf("storage: registering default policy for resource type %q: %w", resourceTypeBlob, err)
 	}
 
 	m := make(map[string]Policy, len(policies))
@@ -242,6 +259,22 @@ func (s *Service) MoveBlob(req MoveBlobRequest) (MoveBlobResponse, error) {
 		return MoveBlobResponse{}, ErrPermissionDenied
 	}
 
+	// Concurrency hardening (docs/DECISION_LOG.md, "Storage:
+	// concurrency-harden DeleteBlob/MoveBlob"): serializes the ENTIRE
+	// check-then-act sequence below (read record, decide, mutate
+	// backends, write record) against any other concurrent MoveBlob or
+	// DeleteBlob call for this exact blob_ref. Two concurrent duplicate
+	// MoveBlob requests for the same blob_ref are safely serialized by
+	// this lock, not raced: whichever acquires it first performs the real
+	// relocation; the second, once unblocked, re-reads the
+	// now-already-updated record and — per the existing same-policy no-op
+	// branch below — becomes a harmless, correctly-audited no-op if it
+	// targets the same new_policy_id (the common "duplicate request"
+	// case), or a second, still-atomic relocation if it targets a
+	// different one. Never a dual-copy or lost-copy outcome.
+	unlock := s.store.lockBlob(req.BlobRef)
+	defer unlock()
+
 	record, found := s.store.get(req.BlobRef)
 	if !found || record.Deleted {
 		_, _ = s.audit.Emit(req.RequestingSubject, "storage.move_blob_failed", resource, "not_found", nil)
@@ -335,6 +368,21 @@ func (s *Service) DeleteBlob(req DeleteBlobRequest) (DeleteBlobResponse, error) 
 		return DeleteBlobResponse{}, ErrPermissionDenied
 	}
 
+	// Concurrency hardening (docs/DECISION_LOG.md, "Storage:
+	// concurrency-harden DeleteBlob/MoveBlob"): serializes the ENTIRE
+	// check-then-act sequence below (read record, check Deleted, run the
+	// deletion mechanism, write the tombstone) against any other
+	// concurrent DeleteBlob or MoveBlob call for this exact blob_ref.
+	// Without this, two concurrent duplicate DeleteBlob requests could
+	// both observe record.Deleted == false before either writes the
+	// tombstone back, and both proceed to run the deletion mechanism and
+	// report success — a double-delete/double-audit-event hazard. With
+	// this lock, exactly one of the two calls performs the real deletion;
+	// the other, once unblocked, re-reads the now-updated record and
+	// correctly hits the "already deleted" branch below.
+	unlock := s.store.lockBlob(req.BlobRef)
+	defer unlock()
+
 	record, found := s.store.get(req.BlobRef)
 	if !found {
 		_, _ = s.audit.Emit(req.RequestingSubject, "storage.delete_blob_failed", resource, "not_found", nil)
@@ -393,14 +441,33 @@ func (s *Service) DeleteBlob(req DeleteBlobRequest) (DeleteBlobResponse, error) 
 // returns the current physical location; for a deleted one it returns a
 // description of how and when it was deleted, so the deletion mechanism
 // stays inspectable rather than a hidden implementation detail. Not
-// marked ascend:mutates (no state change) and not audited per call — high
-// call volume expected (any "where's my data" UI polls this), matching
-// Permissions' CheckPermission precedent for why per-call auditing of a
-// high-volume read is impractical.
+// marked ascend:mutates (no state change) and not audited on a successful
+// answer — high call volume expected (any "where's my data" UI polls
+// this), matching Permissions' CheckPermission precedent for why per-call
+// auditing of a high-volume read is impractical. A denied attempt IS
+// audited, matching RetrieveBlob/MoveBlob/DeleteBlob's own denial-auditing
+// pattern.
+//
+// GATING (charter §3, docs/DECISION_LOG.md "Storage follow-ups...",
+// 2026-07-17): req.RequestingSubject is gated on the SAME PermissionChecker
+// action RetrieveBlob uses (ActionRetrieveBlob, resource ("blob",
+// blob_ref)) — no separate, narrower "location" action exists. If a
+// subject can read a blob's content, they may also learn where it lives.
 func (s *Service) GetStorageLocation(req GetStorageLocationRequest) (GetStorageLocationResponse, error) {
-	if req.BlobRef == "" {
-		return GetStorageLocationResponse{}, fmt.Errorf("%w: blob_ref is required", ErrInvalidArgument)
+	if req.BlobRef == "" || req.RequestingSubject == "" {
+		return GetStorageLocationResponse{}, fmt.Errorf("%w: blob_ref and requesting_subject are required", ErrInvalidArgument)
 	}
+	resource := ResourceRef{ResourceType: resourceTypeBlob, ResourceID: req.BlobRef}
+
+	allowed, err := s.checker.CheckPermission(req.RequestingSubject, ActionRetrieveBlob, resource.ResourceType, resource.ResourceID)
+	if err != nil {
+		return GetStorageLocationResponse{}, fmt.Errorf("storage: permission check failed: %w", err)
+	}
+	if !allowed {
+		_, _ = s.audit.Emit(req.RequestingSubject, "storage.get_storage_location_denied", resource, "permission_denied", nil)
+		return GetStorageLocationResponse{}, ErrPermissionDenied
+	}
+
 	record, found := s.store.get(req.BlobRef)
 	if !found {
 		return GetStorageLocationResponse{}, ErrBlobNotFound

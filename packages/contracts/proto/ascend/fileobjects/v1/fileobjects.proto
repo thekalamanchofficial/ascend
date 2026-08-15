@@ -1,0 +1,190 @@
+syntax = "proto3";
+
+package ascend.fileobjects.v1;
+
+option go_package = "github.com/ascend/services/api/gen/go/ascend/fileobjects/v1;fileobjectsv1";
+
+// File Objects — files as first-class citizens: every file carries
+// identity, ownership, versions, metadata, history, and lifecycle, never a
+// disposable attachment (Art. 2). Frozen from
+// docs/capabilities/file-objects.charter.md §3, after three rounds of
+// guardian re-gate (2026-07-17) — read the charter's §6 in full before
+// implementing; it encodes several load-bearing design decisions
+// (dual-layer Permissions resource mirroring, policy-registration
+// ordering, blob_ref-non-exposure invariant) that are not obvious from
+// this schema alone and are not optional implementation details.
+//
+// IMPLEMENTATION: a normal Go backend service, services/api/internal/fileobjects,
+// composing Storage + Permissions + Identity + Audit through their
+// published contracts only (charter §4, Art. 10). Registers its own
+// "file_object" Permissions resource type at construction (charter §6
+// point 0) — this capability may not merge until Storage's own "blob"
+// policy-registration fix has landed (docs/DECISION_LOG.md, 2026-07-17,
+// "Storage: register 'blob' Permissions policy at construction").
+
+service FileObjectsService {
+  rpc CreateFileObject(CreateFileObjectRequest) returns (CreateFileObjectResponse);
+  rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
+
+  // Charter §3: added at freeze review — the original interface had no
+  // path that ever returned a file's content. Omitting version_ref
+  // resolves to the current (latest) version. Charter §6 point 8: this
+  // response's content field is the only content-bearing surface in this
+  // service; blob_ref (Storage's internal identifier) must never appear
+  // in any response anywhere in this file.
+  rpc GetFileContent(GetFileContentRequest) returns (GetFileContentResponse);
+
+  // Charter §3: added alongside GetFileContent — its optional version_ref
+  // is meaningless without a way to discover what versions exist.
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  rpc GetFileHistory(GetFileHistoryRequest) returns (GetFileHistoryResponse);
+
+  // Charter §3, §6 point 1: action is constrained to exactly two values,
+  // "fileobjects.read" or "fileobjects.write" — not an open string.
+  rpc SetFilePermissions(SetFilePermissionsRequest) returns (SetFilePermissionsResponse);
+
+  rpc GetFileMetadata(GetFileMetadataRequest) returns (GetFileMetadataResponse);
+  rpc SetFileMetadata(SetFileMetadataRequest) returns (SetFileMetadataResponse);
+
+  rpc ExportFile(ExportFileRequest) returns (ExportFileResponse);
+  rpc DeleteFileObject(DeleteFileObjectRequest) returns (DeleteFileObjectResponse);
+}
+
+message FileObject {
+  string file_object_id = 1;
+  string owner = 2;
+  string current_version_ref = 3;
+  string name = 4;
+  string mime_type = 5;
+  repeated string tags = 6;
+  int64 size_bytes = 7;
+  int64 created_at_unix = 8;
+}
+
+message VersionSummary {
+  string version_ref = 1;
+  int64 created_at_unix = 2;
+  string created_by = 3;
+  int64 size_bytes = 4;
+}
+
+message FileEvent {
+  string event_id = 1;
+  string action = 2;
+  string actor = 3;
+  int64 occurred_at_unix = 4;
+  map<string, string> metadata = 5;
+}
+
+message CreateFileObjectRequest {
+  string owner = 1;
+  string requesting_subject = 2;
+  bytes initial_content = 3;
+  string name = 4;
+  string mime_type = 5;
+}
+
+message CreateFileObjectResponse {
+  FileObject file_object = 1;
+}
+
+message CreateVersionRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+  bytes content = 3;
+}
+
+message CreateVersionResponse {
+  string version_ref = 1;
+}
+
+message GetFileContentRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+  // Optional. Omit to resolve to the current version (charter §5 — this
+  // is the only version-resolution behavior in the default path).
+  string version_ref = 3;
+}
+
+message GetFileContentResponse {
+  bytes content = 1;
+}
+
+message ListVersionsRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+}
+
+message ListVersionsResponse {
+  repeated VersionSummary versions = 1;
+}
+
+message GetFileHistoryRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+}
+
+message GetFileHistoryResponse {
+  // Charter §6 point 8: this must be exactly File Objects' own emitted
+  // events (CreateFileObject/CreateVersion/SetFilePermissions/
+  // SetFileMetadata/DeleteFileObject) — never a raw aggregation of the
+  // underlying Permissions/Storage calls this capability makes
+  // internally. No event's metadata may contain a blob_ref value.
+  repeated FileEvent events = 1;
+}
+
+message SetFilePermissionsRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+  bool grant = 3; // true = grant, false = revoke
+  string subject = 4;
+  // Exactly "fileobjects.read" or "fileobjects.write" (charter §6 point 1).
+  string action = 5;
+  string scope = 6;
+}
+
+message SetFilePermissionsResponse {}
+
+message GetFileMetadataRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+}
+
+message GetFileMetadataResponse {
+  string name = 1;
+  string mime_type = 2;
+  repeated string tags = 3;
+  int64 size_bytes = 4; // derived, never caller-settable
+}
+
+message SetFileMetadataRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+  optional string name = 3;
+  optional string mime_type = 4;
+  repeated string tags = 5;
+}
+
+message SetFileMetadataResponse {}
+
+message ExportFileRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+}
+
+message ExportFileResponse {
+  // All versions, not just current (charter §3, Art. 9 "complete
+  // artifact" promise), retrieved per-version via Storage's RetrieveBlob
+  // (charter §6 point 7) — never Storage's ExportAllBlobs, which has its
+  // own tracked, unrelated caller-identity gap.
+  bytes export_blob = 1;
+  string format_version = 2;
+}
+
+message DeleteFileObjectRequest {
+  string file_object_id = 1;
+  string requesting_subject = 2;
+}
+
+message DeleteFileObjectResponse {}

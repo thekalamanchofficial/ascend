@@ -21,6 +21,25 @@ type Store struct {
 
 	records      map[string]BlobRecord
 	wrappingKeys map[string][]byte
+
+	// opLocks provides one *sync.Mutex per blob_ref, used to serialize an
+	// entire check-then-act sequence (e.g. DeleteBlob's "read the record,
+	// decide it's not already deleted, perform the deletion mechanism,
+	// write the tombstone" sequence) as a single atomic operation.
+	//
+	// This is NOT redundant with `mu` above: `mu` only makes each
+	// individual map read/write (get/put/etc.) atomic in isolation — it
+	// says nothing about two *sequences* of several such calls, made by
+	// two different goroutines for the SAME blob_ref, never interleaving
+	// with each other. Without opLocks, two concurrent DeleteBlob calls
+	// for the same blob_ref could both call get() and both observe
+	// Deleted == false before either calls put() — both would then
+	// proceed to run the deletion mechanism and both would report
+	// success, a real double-delete/double-audit-event hazard. See
+	// docs/DECISION_LOG.md, "Storage: concurrency-harden DeleteBlob/
+	// MoveBlob (per-blob_ref operation lock)", and service.go's
+	// DeleteBlob/MoveBlob for where this is acquired.
+	opLocks sync.Map // map[string]*sync.Mutex, keyed by blob_ref
 }
 
 func NewStore() *Store {
@@ -28,6 +47,18 @@ func NewStore() *Store {
 		records:      make(map[string]BlobRecord),
 		wrappingKeys: make(map[string][]byte),
 	}
+}
+
+// lockBlob acquires this Store's per-blob_ref operation lock and returns
+// an unlock function. Callers must defer the returned function. Different
+// blob_refs never block each other — only concurrent calls that target
+// the SAME blob_ref serialize, so this does not become a whole-service
+// bottleneck as blob count grows.
+func (s *Store) lockBlob(blobRef string) func() {
+	lockIface, _ := s.opLocks.LoadOrStore(blobRef, &sync.Mutex{})
+	lock := lockIface.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (s *Store) put(record BlobRecord) {
