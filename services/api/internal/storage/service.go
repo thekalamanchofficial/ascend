@@ -19,7 +19,7 @@ import (
 // services/api/internal/audit directly (see AuditEmitter in types.go).
 // Documented in docs/DECISION_LOG.md, following Permissions' precedent.
 type Service struct {
-	store    *Store
+	store    Store
 	policies map[string]Policy
 	order    []string // policy IDs in registration order, for deterministic ListStoragePolicies
 	checker  PermissionChecker
@@ -28,11 +28,21 @@ type Service struct {
 	genRef   func() (string, error)
 }
 
-// NewService constructs a Service. policies must be non-empty and every
-// entry's Backend must be non-nil — Storage never advertises a policy it
-// cannot currently honor (charter §5/§6), so an empty or malformed policy
-// set is a construction-time error, not a runtime surprise discovered
-// later via ListStoragePolicies.
+// NewService constructs a Service against an injected Store. policies must
+// be non-empty and every entry's Backend must be non-nil — Storage never
+// advertises a policy it cannot currently honor (charter §5/§6), so an
+// empty or malformed policy set is a construction-time error, not a
+// runtime surprise discovered later via ListStoragePolicies.
+//
+// store is taken as the first parameter, mirroring Permissions'
+// NewService(store, ...) parameter ordering exactly
+// (services/api/internal/permissions/service.go, and its call site in
+// main.go) — Store was introduced as an explicit interface (store.go) so
+// callers can inject either NewInMemoryStore() (tests, and this package's
+// own pre-Postgres call sites) or NewPostgresStore(pool)
+// (postgres_store.go) without this constructor's signature changing again.
+// See docs/DECISION_LOG.md, "Storage: Store interface introduced,
+// PostgresStore added".
 //
 // NewService also registers resourceTypeBlob's default policy with the
 // injected PermissionChecker (checker.DefinePolicy) before returning.
@@ -47,7 +57,10 @@ type Service struct {
 // caller can reach a CheckPermission call. See
 // docs/DECISION_LOG.md, "Storage: register 'blob' Permissions policy at
 // construction (closing a real fail-closed gap)".
-func NewService(policies []Policy, checker PermissionChecker, audit AuditEmitter) (*Service, error) {
+func NewService(store Store, policies []Policy, checker PermissionChecker, audit AuditEmitter) (*Service, error) {
+	if store == nil {
+		return nil, errors.New("storage: a Store is required")
+	}
 	if len(policies) == 0 {
 		return nil, errors.New("storage: at least one storage policy is required")
 	}
@@ -75,7 +88,7 @@ func NewService(policies []Policy, checker PermissionChecker, audit AuditEmitter
 	}
 
 	return &Service{
-		store:    NewStore(),
+		store:    store,
 		policies: m,
 		order:    order,
 		checker:  checker,

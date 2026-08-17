@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/ascend/services/api/internal/fileobjects"
 	"github.com/ascend/services/api/internal/identity"
 	"github.com/ascend/services/api/internal/permissions"
+	"github.com/ascend/services/api/internal/platform"
 	"github.com/ascend/services/api/internal/sessionauth"
 	"github.com/ascend/services/api/internal/storage"
 )
@@ -52,10 +54,33 @@ func limitRequestBody(next http.Handler) http.Handler {
 // Objects are the last two backend capabilities to come online this pass;
 // every backend capability chartered so far is now network-reachable.
 //
-// newRouter builds the composition root and full HTTP router. Split out
-// from main() so an integration test can exercise the real, fully-wired
-// server (via httptest) without a separate process — see main_test.go.
-func newRouter() http.Handler {
+// Real database infrastructure landed 2026-08-16 (docs/DECISION_LOG.md,
+// "Database setup: shared platform foundation + Audit on real Postgres"):
+// Audit was the first capability backed by real Postgres. Extended
+// 2026-08-17 across three batches ("Migrating remaining capabilities onto
+// Postgres: batch plan") — Batch A (Identity, Permissions), Batch B
+// (Storage metadata, File Objects), and Batch C (Session/Request
+// Authentication, split across Postgres for sessions and Redis for
+// challenge nonces — the only capability using Redis so far). Every
+// backend capability's durable data now survives a restart. Storage's blob
+// *bytes* still live on the local filesystem (unchanged Backend/
+// FilesystemBackend) — only its metadata moved to Postgres. The shared
+// internal/platform package's S3-compatible client is still constructed
+// and health-checked at startup but consumed by nothing yet, reserved for
+// a future pass wiring Storage's blob bytes onto it.
+//
+// newRouter builds the composition root and full HTTP router, given an
+// already-constructed Platform (docs/DECISION_LOG.md, 2026-08-16, "Database
+// setup: shared platform foundation + Audit on real Postgres"). plat is
+// constructed once by main() (or once per test binary by main_test.go's
+// TestMain) — never inside newRouter itself — specifically so migrations
+// don't re-run and a fresh connection pool isn't opened on every call; a
+// real integration test suite calls newRouter repeatedly (once per
+// httptest.Server) and must reuse one Platform, not accumulate one per
+// test. Split out from main() so an integration test can exercise the
+// real, fully-wired server (via httptest) without a separate process — see
+// main_test.go.
+func newRouter(plat *platform.Platform) http.Handler {
 	// --- Composition root: construct real capability instances, wired
 	// together via each capability's own DI interfaces, not fakes. ---
 
@@ -66,18 +91,41 @@ func newRouter() http.Handler {
 	// own doc comment in wiring.go for the full rationale.
 	checker := &lateBoundPermissionChecker{}
 
-	auditStore := audit.NewInMemoryStore()
+	// Audit is now backed by real Postgres, not InMemoryStore — the first
+	// capability in this build to survive a server restart. No in-memory
+	// fallback: a misconfigured/unreachable Postgres fails server startup
+	// entirely (see main(), which log.Fatalf's on platform.New's error)
+	// rather than silently discarding audit history, matching this
+	// codebase's existing fail-fast-on-construction-error precedent
+	// (Storage/File Objects below do the same for their own errors).
+	auditStore := audit.NewPostgresStore(plat.DB)
 	auditSvc := audit.NewService(auditStore, checker)
 
-	permissionsStore := permissions.NewStore()
+	// Permissions and Identity are now also backed by real Postgres
+	// (docs/DECISION_LOG.md, 2026-08-17, "Migrating remaining capabilities
+	// onto Postgres: batch plan" — Batch A). Permissions' Store became a
+	// real interface in this same pass (previously a concrete *Store);
+	// NewPostgresStore satisfies it exactly like NewInMemoryStore always
+	// did, so this is the only line that changed in Permissions' own
+	// wiring here.
+	permissionsStore := permissions.NewPostgresStore(plat.DB)
 	permsSvc := permissions.NewService(permissionsStore, permissionsAuditEmitterAdapter{audit: auditSvc})
 
 	checker.svc = permsSvc // patch the late-bound reference now that both exist
 
-	identityStore := identity.NewInMemoryStore()
+	identityStore := identity.NewPostgresStore(plat.DB)
 	identitySvc := identity.NewService(identityStore, auditSvc) // *audit.Service satisfies identity.AuditEmitter directly (type-alias ResourceRef)
 
+	// Session/Request Authentication is Batch C (docs/DECISION_LOG.md,
+	// 2026-08-17, "Batch C (Session/Request Authentication) design"), the
+	// last capability in the database-migration series and the only one
+	// split across two backends: challenge nonces (pure ephemeral, no
+	// durability/export need) go to Redis; sessions (ExportSessions must
+	// show expired-but-not-yet-revoked sessions) go to Postgres. Every
+	// backend capability's durable data now survives a restart.
 	sessionAuthSvc := sessionauth.NewService(
+		sessionauth.NewRedisNonceStore(plat.Redis),
+		sessionauth.NewPostgresSessionStore(plat.DB),
 		deviceResolverAdapter{identity: identitySvc},
 		auditEmitterAdapter{audit: auditSvc},
 	)
@@ -93,7 +141,15 @@ func newRouter() http.Handler {
 	// point for the first time. File Objects is constructed after Storage
 	// and depends on it directly (fileobjectsStorageClientAdapter) — no
 	// circular dependency here, unlike Audit/Permissions.
+	//
+	// Both metadata stores are now real Postgres too (docs/DECISION_LOG.md,
+	// 2026-08-17, "Migrating remaining capabilities onto Postgres: batch
+	// plan" — Batch B). Storage's blob *bytes* still live on the local
+	// filesystem (NewFilesystemService's own two local-disk policies,
+	// unchanged) — only blob metadata (owner, policy_id, location,
+	// tombstone fields) and the outer wrapping keys moved to Postgres.
 	storageSvc, err := storage.NewFilesystemService(
+		storage.NewPostgresStore(plat.DB),
 		storagePermissionCheckerAdapter{perms: permsSvc},
 		storageAuditEmitterAdapter{audit: auditSvc},
 	)
@@ -102,6 +158,7 @@ func newRouter() http.Handler {
 	}
 
 	fileobjectsSvc, err := fileobjects.NewService(
+		fileobjects.NewPostgresStore(plat.DB),
 		fileobjectsStorageClientAdapter{storage: storageSvc},
 		fileobjectsPermissionsClientAdapter{perms: permsSvc},
 		fileobjectsAuditEmitterAdapter{audit: auditSvc},
@@ -162,6 +219,24 @@ func newRouter() http.Handler {
 }
 
 func main() {
+	ctx := context.Background()
+
+	// Platform (Postgres pool + migrations, Redis client, S3-compatible
+	// client) is constructed once, here, before any capability — every
+	// error here is fatal at startup, not a silent degrade (see
+	// platform.New's own doc comment). See docs/DECISION_LOG.md,
+	// 2026-08-16, "Database setup: shared platform foundation + Audit on
+	// real Postgres".
+	cfg, err := platform.ConfigFromEnv()
+	if err != nil {
+		log.Fatalf("loading platform configuration: %v", err)
+	}
+	plat, err := platform.New(ctx, cfg)
+	if err != nil {
+		log.Fatalf("constructing platform (postgres/redis/s3): %v", err)
+	}
+	defer plat.Close()
+
 	addr := ":8080"
 	// Explicit timeouts, not the http.ListenAndServe default of "none" —
 	// added 2026-08-16 alongside the body-size cap above, same finding:
@@ -172,7 +247,7 @@ func main() {
 	// endpoints exist yet); revisit deliberately if one is added.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newRouter(),
+		Handler:           newRouter(plat),
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,

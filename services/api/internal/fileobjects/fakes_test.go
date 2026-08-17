@@ -367,7 +367,7 @@ func newTestService(t *testing.T) (*Service, *fakeStorageClient, *memPermissions
 	storage := newFakeStorageClient()
 	perms := newMemPermissions()
 	audit := newFakeAuditEmitter()
-	svc, err := NewService(storage, perms, audit)
+	svc, err := NewService(newInMemoryStore(), storage, perms, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}

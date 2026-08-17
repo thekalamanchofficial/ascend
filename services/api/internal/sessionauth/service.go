@@ -30,11 +30,12 @@ const (
 )
 
 // Service implements the seven SessionAuthService RPCs (sessionauth.proto)
-// against two in-memory stores and two injected seams (DeviceResolver,
-// AuditEmitter) — see NewService and types.go.
+// against two injected storage seams (NonceStore, SessionStore — store.go)
+// and two injected non-storage seams (DeviceResolver, AuditEmitter) — see
+// NewService and types.go.
 type Service struct {
-	nonces   *nonceStore
-	sessions *sessionStore
+	nonces   NonceStore
+	sessions SessionStore
 	failures *failureTracker
 
 	devices DeviceResolver
@@ -51,15 +52,22 @@ type Service struct {
 	now func() time.Time
 }
 
-// NewService wires a Service. `devices` resolves current device public
-// keys (Identity's data, via DI — see types.go's DeviceResolver); a nil
-// devices seam defaults to a resolver that always reports "not found",
-// which fails IssueSession closed rather than open if a caller forgets to
-// wire one. `emitter` is the Art. 5 audit seam; a nil emitter defaults to
+// NewService wires a Service. `nonces`/`sessions` are the two storage
+// seams this capability splits across two different backends (see store.go's
+// package doc comment and docs/DECISION_LOG.md's "Batch C (Session/Request
+// Authentication) design" entry) — callers pass a concrete implementation
+// explicitly (e.g. NewInMemoryNonceStore()/NewInMemorySessionStore() for
+// tests, or RedisNonceStore/PostgresSessionStore in production), matching
+// the "store(s) first" parameter-ordering convention established for
+// Storage/File Objects. `devices` resolves current device public keys
+// (Identity's data, via DI — see types.go's DeviceResolver); a nil devices
+// seam defaults to a resolver that always reports "not found", which fails
+// IssueSession closed rather than open if a caller forgets to wire one.
+// `emitter` is the Art. 5 audit seam; a nil emitter defaults to
 // NoopAuditEmitter, which fails loudly (returns an error) rather than
 // silently dropping audit events — mirroring Identity's/Permissions'
 // identical precedent.
-func NewService(devices DeviceResolver, emitter AuditEmitter) *Service {
+func NewService(nonces NonceStore, sessions SessionStore, devices DeviceResolver, emitter AuditEmitter) *Service {
 	if devices == nil {
 		devices = alwaysNotFoundDeviceResolver{}
 	}
@@ -67,8 +75,8 @@ func NewService(devices DeviceResolver, emitter AuditEmitter) *Service {
 		emitter = NoopAuditEmitter{}
 	}
 	return &Service{
-		nonces:          newNonceStore(),
-		sessions:        newSessionStore(),
+		nonces:          nonces,
+		sessions:        sessions,
 		failures:        newFailureTracker(),
 		devices:         devices,
 		audit:           emitter,

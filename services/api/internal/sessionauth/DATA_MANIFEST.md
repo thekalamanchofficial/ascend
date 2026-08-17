@@ -54,9 +54,12 @@ Identity's device validity via `DeviceResolver`, it does not store a copy).
   Identity's `BindDevice` (`docs/DECISION_LOG.md`, 2026-07-16). Short-lived
   (this implementation: 2 minutes, `DefaultChallengeNonceLifetime` in
   `service.go`) and consumed on first successful use — **not retained once
-  consumed or expired** (`store.go`'s `nonceStore.consumeIfValid` deletes
-  the record outright on consumption; expired entries are likewise deleted
-  on next access rather than kept around). No export path exists for this
+  consumed or expired** (`store.go`'s `InMemoryNonceStore.consumeIfValid`
+  deletes the record outright on consumption, and expired entries are
+  likewise deleted on next access rather than kept around;
+  `redis_nonce_store.go`'s `RedisNonceStore` achieves the same outcome by
+  leaning on Redis's own native per-key TTL and an atomic Lua GET-compare-DEL
+  for consumption — see that file for detail). No export path exists for this
   data and none is required — it is transient authentication-protocol
   state, not a durable fact about the user, and the charter is explicit
   that it is not retained.

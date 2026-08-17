@@ -61,7 +61,7 @@ func (f *fakeAudit) count(action string) int {
 
 func newTestService() (*Service, *fakeAudit) {
 	audit := &fakeAudit{}
-	svc := NewService(NewStore(), audit)
+	svc := NewService(NewInMemoryStore(), audit)
 	return svc, audit
 }
 

@@ -14,7 +14,7 @@ import (
 // — the literal substring scripts/constitution/check-audit-events.sh
 // greps for on every // ascend:mutates-marked function.
 type Service struct {
-	store   *Store
+	store   Store
 	storage StorageClient
 	perms   PermissionsClient
 	audit   AuditEmitter
@@ -44,7 +44,17 @@ type Service struct {
 // responsibility (see NewService's doc block in
 // services/api/internal/storage/service.go, which this capability's
 // prerequisite check confirmed is already in place).
-func NewService(storage StorageClient, perms PermissionsClient, audit AuditEmitter) (*Service, error) {
+//
+// store is accepted as the first parameter, mirroring Permissions' own
+// NewService(store Store, ...) parameter ordering (internal/permissions/
+// service.go) after its identical Store-interface introduction — reading
+// "construct this Service against this persistence layer, plus these DI
+// seams" left-to-right, store first, matches that precedent rather than
+// inventing a new convention.
+func NewService(store Store, storage StorageClient, perms PermissionsClient, audit AuditEmitter) (*Service, error) {
+	if store == nil {
+		return nil, fmt.Errorf("fileobjects: a Store is required")
+	}
 	if storage == nil {
 		return nil, fmt.Errorf("fileobjects: a StorageClient is required")
 	}
@@ -59,7 +69,7 @@ func NewService(storage StorageClient, perms PermissionsClient, audit AuditEmitt
 	}
 
 	return &Service{
-		store:      newStore(),
+		store:      store,
 		storage:    storage,
 		perms:      perms,
 		audit:      audit,

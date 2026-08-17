@@ -14,7 +14,7 @@ import (
 func TestNewFilesystemService_EndToEnd(t *testing.T) {
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
-	svc, err := NewFilesystemService(checker, audit)
+	svc, err := NewFilesystemService(NewInMemoryStore(), checker, audit)
 	if err != nil {
 		t.Fatalf("NewFilesystemService: %v", err)
 	}

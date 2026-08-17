@@ -47,7 +47,7 @@ func TestNewService_RegistersFileObjectPolicyOnConstruction(t *testing.T) {
 func TestNewService_PropagatesDefinePolicyFailure(t *testing.T) {
 	perms := newMemPermissions()
 	perms.definePolicyErr = errors.New("boom")
-	_, err := NewService(newFakeStorageClient(), perms, newFakeAuditEmitter())
+	_, err := NewService(newInMemoryStore(), newFakeStorageClient(), perms, newFakeAuditEmitter())
 	if err == nil {
 		t.Fatalf("expected NewService to propagate a DefinePolicy failure as a construction-time error")
 	}

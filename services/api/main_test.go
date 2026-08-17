@@ -2,16 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/ascend/services/api/internal/fileobjects"
+	"github.com/ascend/services/api/internal/platform"
 	"github.com/ascend/services/api/internal/storage"
 )
 
@@ -45,10 +49,53 @@ import (
 // establishes Permissions ownership via GrantPermission" — a blob's true
 // owner can actually retrieve/move/delete/export it after storing it
 // through the real, live Permissions instance, not a fake.
+//
+// Extended again 2026-08-16 for "Database setup: shared platform
+// foundation + Audit on real Postgres" — newRouter now requires a real
+// Platform (Postgres/Redis/S3), constructed once by TestMain below rather
+// than per-test, so this whole binary's tests require `docker compose up
+// -d` (repo root) and a populated .env first. TestMain skips the entire
+// binary cleanly (a clear log line, exit 0) if DATABASE_URL and friends
+// aren't set — one discoverable gate, not scattered per-test checks. This
+// is coarser than a per-test t.Skip (no individual "--- SKIP" lines), a
+// deliberate trade-off against touching every existing test function.
+
+// testPlatform is constructed once by TestMain (below) and reused by every
+// test in this binary via newTestServer — never reconstructed per test,
+// which would otherwise re-run migrations and open a fresh, never-closed
+// connection pool on every one of this file's ~15 test functions.
+var testPlatform *platform.Platform
+
+// TestMain gates this entire binary on real infrastructure being
+// available. If DATABASE_URL (and the rest of platform.Config) isn't set,
+// this prints one clear message and exits 0 (skips) rather than letting
+// every test fail with a confusing connection error — `go test ./...` from
+// a machine without `docker compose up -d` run first stays clean, not
+// broken. See docs/DECISION_LOG.md, "Database setup: shared platform
+// foundation + Audit on real Postgres".
+func TestMain(m *testing.M) {
+	cfg, err := platform.ConfigFromEnv()
+	if err != nil {
+		fmt.Println("main_test.go: platform configuration not set, skipping services/api integration tests — run `docker compose up -d` from the repo root and populate .env first (see .env.example):", err)
+		os.Exit(0)
+	}
+
+	ctx := context.Background()
+	plat, err := platform.New(ctx, cfg)
+	if err != nil {
+		fmt.Println("main_test.go: constructing platform failed, skipping services/api integration tests:", err)
+		os.Exit(0)
+	}
+	testPlatform = plat
+
+	code := m.Run()
+	plat.Close()
+	os.Exit(code)
+}
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(newRouter())
+	srv := httptest.NewServer(newRouter(testPlatform))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -426,7 +473,19 @@ func TestPermissionsRoutes_GatedAndReachable(t *testing.T) {
 	bob := createTestIdentity(t, srv.URL)
 	aliceToken := issueRealSession(t, srv.URL, alice)
 
-	resource := map[string]string{"resource_type": "test_resource", "resource_id": "res-1"}
+	// resource_id incorporates alice's own identityRef (a fresh random UUID
+	// created by createTestIdentity above, per test run) rather than a
+	// fixed literal — Security Steward's Batch A merge-gate finding
+	// (docs/DECISION_LOG.md, 2026-08-17): now that Permissions is backed by
+	// durable Postgres, a fixed resource_id would remain permanently owned
+	// by whichever identity first ran this test, causing every subsequent
+	// run's bootstrap-owner self-grant below to be correctly denied
+	// (403, not the 201 this test asserts) — not a product bug, but a test
+	// fixture that assumed the old in-memory-per-process-lifetime
+	// semantics. This resource_type ("test_resource") is deliberately
+	// never registered via DefinePolicy — see the CheckPermission
+	// fail-closed assertion below, unaffected by this change.
+	resource := map[string]string{"resource_type": "test_resource", "resource_id": "res-1-" + alice.identityRef}
 
 	t.Run("NoToken_Rejected", func(t *testing.T) {
 		resp := postWithAuth(t, srv.URL+"/v1/permissions/grants", "", map[string]any{

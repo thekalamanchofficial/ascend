@@ -134,7 +134,7 @@ func issueValidSession(t *testing.T, svc *Service, priv ed25519.PrivateKey, iden
 func TestFullHappyPath_ChallengeIssueValidateListExportRevoke(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-alice", "dev-laptop"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -209,7 +209,7 @@ func TestFullHappyPath_ChallengeIssueValidateListExportRevoke(t *testing.T) {
 func TestIssueSession_ReplayRejected_SameNonceSameProofFailsSecondTime(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-bob", "dev-phone"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -259,7 +259,7 @@ func TestIssueSession_ReplayRejected_ConcurrentDuplicateRequestsOnlyOneWins(t *t
 	// request from many goroutines at once and asserts exactly one winner.
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-carol", "dev-tablet"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -300,7 +300,7 @@ func TestIssueSession_ReplayRejected_ConcurrentDuplicateRequestsOnlyOneWins(t *t
 func TestIssueSession_RevokedDeviceCannotIssueEvenWithFreshNonceAndValidSignature(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-dave", "dev-watch"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -350,7 +350,7 @@ func (f *fakeDeviceResolver) hasNoDevice(identityRef, deviceID string) bool {
 func TestRevokeAllSessions_OnlyActsOnCallersOwnResolvedIdentity(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	_, privA := newTestIdentity(t, resolver, "id-alice", "dev-a1")
 	_, privB := newTestIdentity(t, resolver, "id-bob", "dev-b1")
@@ -392,7 +392,7 @@ func TestRevokeAllSessions_OnlyActsOnCallersOwnResolvedIdentity(t *testing.T) {
 func TestListActiveSessionsAndExportSessions_OnlyActOnCallersOwnResolvedIdentity(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	_, privA := newTestIdentity(t, resolver, "id-alice", "dev-a1")
 	_, privB := newTestIdentity(t, resolver, "id-bob", "dev-b1")
@@ -435,7 +435,7 @@ func TestListActiveSessionsAndExportSessions_OnlyActOnCallersOwnResolvedIdentity
 func TestExportSessions_NeverContainsSessionTokenValue(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-erin", "dev-desktop"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -494,7 +494,7 @@ func (c *manualClock) advance(d time.Duration) {
 func TestValidateSession_ExpiredSessionIsInvalid(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 	clock := newManualClock()
 	svc.now = clock.now
 
@@ -526,7 +526,7 @@ func TestValidateSession_ExpiredSessionIsInvalid(t *testing.T) {
 func TestGetSessionChallenge_ExpiredNonceRejected(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 	clock := newManualClock()
 	svc.now = clock.now
 
@@ -556,7 +556,7 @@ func TestGetSessionChallenge_ExpiredNonceRejected(t *testing.T) {
 func TestIssueSession_InvalidSignatureRejected(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	identityRef, deviceID := "id-henry", "dev-phone"
 	newTestIdentity(t, resolver, identityRef, deviceID)
@@ -583,7 +583,7 @@ func TestIssueSession_InvalidSignatureRejected(t *testing.T) {
 func TestValidateSession_RepeatedFailuresEmitAnomalyAuditEvent(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	badToken := "definitely-not-a-real-session-token"
 	for i := 0; i < validateFailureThreshold; i++ {
@@ -610,7 +610,7 @@ func TestIssueSession_AuditEmitErrorIsSurfaced_NotDiscarded(t *testing.T) {
 	// spawn brief ("check and handle the returned error at every call
 	// site — do not discard it").
 	resolver := newFakeDeviceResolver()
-	svc := NewService(resolver, erroringAuditEmitter{})
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, erroringAuditEmitter{})
 
 	identityRef, deviceID := "id-ivy", "dev-phone"
 	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
@@ -636,7 +636,7 @@ func TestIssueSession_AuditEmitErrorIsSurfaced_NotDiscarded(t *testing.T) {
 func TestRevokeSession_UnknownTokenRejected(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()
-	svc := NewService(resolver, audit)
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
 
 	_, err := svc.RevokeSession(RevokeSessionRequest{SessionToken: "never-issued"})
 	if !errors.Is(err, ErrSessionNotFound) {

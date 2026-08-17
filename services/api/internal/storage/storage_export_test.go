@@ -168,7 +168,7 @@ func TestExportAllBlobs_DeniedForNonOwnerEvenWithFullGrantCoverage(t *testing.T)
 	checker := newFakePermissionChecker(true) // allow-everything, on purpose — see doc comment above
 	backend := newFakeBackend(true, "fake")
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}

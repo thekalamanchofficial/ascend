@@ -81,7 +81,7 @@ func TestDeleteBlob_ConcurrentDuplicateRequests_ExactlyOneSucceeds(t *testing.T)
 		checker := newFakePermissionChecker(true)
 		audit := newFakeAuditEmitter()
 
-		svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+		svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 		if err != nil {
 			t.Fatalf("iteration %d: NewService: %v", i, err)
 		}
@@ -199,7 +199,7 @@ func TestMoveBlob_ConcurrentDuplicateRequests_SafelySerialized(t *testing.T) {
 		checker := newFakePermissionChecker(true)
 		audit := newFakeAuditEmitter()
 
-		svc, err := NewService([]Policy{
+		svc, err := NewService(NewInMemoryStore(), []Policy{
 			{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA},
 			{ID: "policy-b", DisplayName: "B", Description: "d", Backend: backendB},
 		}, checker, audit)

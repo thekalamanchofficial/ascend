@@ -16,7 +16,7 @@ func newTestService(t *testing.T, allowPerm bool) (*Service, *fakeAuditEmitter, 
 		{ID: "policy-a", DisplayName: "Policy A", Description: "test policy A", Backend: backendA},
 		{ID: "policy-b", DisplayName: "Policy B", Description: "test policy B", Backend: backendB},
 	}
-	svc, err := NewService(policies, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), policies, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestStoreBlob_GrantPermissionFailureRollsBack(t *testing.T) {
 	checker.grantErr = errors.New("fake: grant failed")
 	audit := newFakeAuditEmitter()
 
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestStoreBlob_AuditFailureRollsBack(t *testing.T) {
 	audit := newFakeAuditEmitter()
 	audit.failAll = true
 
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestRetrieveBlob_PermissionDenied(t *testing.T) {
 	// blob already stored above) but is wired with a denying
 	// PermissionChecker instead.
 	denyingChecker := newFakePermissionChecker(false)
-	svcDeny, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: mustGetPolicyBackend(t, svc, "policy-a")}}, denyingChecker, audit)
+	svcDeny, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: mustGetPolicyBackend(t, svc, "policy-a")}}, denyingChecker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestRetrieveBlob_AuditFailureWithholdsData(t *testing.T) {
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
 
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestMoveBlob_RollbackWhenOldDeleteFails(t *testing.T) {
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
 
-	svc, err := NewService([]Policy{
+	svc, err := NewService(NewInMemoryStore(), []Policy{
 		{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA},
 		{ID: "policy-b", DisplayName: "B", Description: "d", Backend: backendB},
 	}, checker, audit)
@@ -422,7 +422,7 @@ func TestDeleteBlob_CryptoShredPath(t *testing.T) {
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
 
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendNoPhysicalDelete}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendNoPhysicalDelete}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestDeleteBlob_PermissionDenied(t *testing.T) {
 	backendA := newFakeBackend(true, "fake-a")
 	allowChecker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, allowChecker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, allowChecker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -538,7 +538,7 @@ func TestDeleteBlob_PermissionDenied(t *testing.T) {
 	}
 
 	denyChecker := newFakePermissionChecker(false)
-	svcDeny, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, denyChecker, audit)
+	svcDeny, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backendA}}, denyChecker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -576,7 +576,7 @@ func TestListStoragePolicies_OnlyAdvertisesConfiguredPolicies(t *testing.T) {
 }
 
 func TestNewService_RejectsEmptyPolicySet(t *testing.T) {
-	_, err := NewService(nil, newFakePermissionChecker(true), newFakeAuditEmitter())
+	_, err := NewService(NewInMemoryStore(), nil, newFakePermissionChecker(true), newFakeAuditEmitter())
 	if err == nil {
 		t.Fatalf("expected NewService to reject an empty policy set")
 	}
@@ -593,7 +593,7 @@ func TestNewService_RegistersBlobPolicyOnConstruction(t *testing.T) {
 	backend := newFakeBackend(true, "fake")
 	policies := []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}
 
-	if _, err := NewService(policies, checker, newFakeAuditEmitter()); err != nil {
+	if _, err := NewService(NewInMemoryStore(), policies, checker, newFakeAuditEmitter()); err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
 
@@ -625,7 +625,7 @@ func TestNewService_PropagatesDefinePolicyFailure(t *testing.T) {
 	backend := newFakeBackend(true, "fake")
 	policies := []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}
 
-	if _, err := NewService(policies, checker, newFakeAuditEmitter()); err == nil {
+	if _, err := NewService(NewInMemoryStore(), policies, checker, newFakeAuditEmitter()); err == nil {
 		t.Fatalf("expected NewService to propagate a DefinePolicy failure")
 	}
 }
@@ -664,7 +664,7 @@ func TestGetStorageLocation_DeniedForNonGrantedSubject(t *testing.T) {
 	checker := newRealisticPermissionChecker()
 	backend := newFakeBackend(true, "fake")
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestGetStorageLocation_AllowedForOwner(t *testing.T) {
 	checker := newRealisticPermissionChecker()
 	backend := newFakeBackend(true, "fake")
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -711,7 +711,7 @@ func TestGetStorageLocation_AllowedForGrantedSubject(t *testing.T) {
 	checker := newRealisticPermissionChecker()
 	backend := newFakeBackend(true, "fake")
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}

@@ -17,12 +17,12 @@ import (
 // services/api/internal/audit directly (see AuditEmitter in types.go).
 // Documented in docs/DECISION_LOG.md.
 type Service struct {
-	store *Store
+	store Store
 	audit AuditEmitter
 	now   func() time.Time
 }
 
-func NewService(store *Store, audit AuditEmitter) *Service {
+func NewService(store Store, audit AuditEmitter) *Service {
 	return &Service{store: store, audit: audit, now: time.Now}
 }
 

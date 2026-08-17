@@ -5,23 +5,60 @@ import (
 	"time"
 )
 
-// Storage for this first pass is in-memory, mutex-guarded, and
-// interface-isolated behind the two narrow types below (nonceStore,
-// sessionStore) — the same "in-memory first pass, swap internals later"
-// precedent Identity/Permissions/Audit each established (see
-// docs/DECISION_LOG.md, e.g. "Permissions storage: in-memory store behind a
-// narrow Store type, not Postgres directly"). Service (service.go) never
-// reaches into either store's internal maps directly.
+// Storage for this capability splits across two different backends per a
+// documented decision (docs/DECISION_LOG.md, "Batch C (Session/Request
+// Authentication) design"): challenge nonces are pure ephemeral, single-use
+// state with no durability/export requirement (Redis, see
+// redis_nonce_store.go), while sessions are durable and must survive a
+// restart — ExportSessions must be able to show expired-but-not-yet-revoked
+// sessions, which a pure TTL store would evict and lose (Postgres, see
+// postgres_session_store.go). Both concrete backends satisfy the two
+// exported interfaces below (NonceStore, SessionStore) — Service
+// (service.go) is written against those interfaces and does not know or
+// care which concrete implementation actually backs it. InMemoryNonceStore/
+// InMemorySessionStore below are the original, still-supported in-memory
+// implementations (e.g. for tests), following the same
+// "in-memory first pass, swap internals later" precedent Identity/
+// Permissions/Audit each established.
 //
-// Two separate stores exist because they have genuinely different shapes
-// and lifetimes: nonces are short-lived and consumed exactly once (no
-// history retained — see DATA_MANIFEST.md, "not retained once consumed or
-// expired"); sessions are longer-lived, looked up by token on every
-// request, and enumerated/exported by identity. Sharing one map/mutex
-// between the two would couple two operations (nonce consumption under
-// concurrent replay, and session issuance/lookup) that don't need to
-// serialize against each other, logged as a documented decision in
-// docs/DECISION_LOG.md.
+// Two separate stores exist (rather than one shared store) because they
+// have genuinely different shapes and lifetimes: nonces are short-lived and
+// consumed exactly once (no history retained — see DATA_MANIFEST.md, "not
+// retained once consumed or expired"); sessions are longer-lived, looked up
+// by token on every request, and enumerated/exported by identity. Sharing
+// one map/mutex (or one backend) between the two would couple two
+// operations (nonce consumption under concurrent replay, and session
+// issuance/lookup) that don't need to serialize against each other, logged
+// as a documented decision in docs/DECISION_LOG.md.
+
+// NonceStore is the persistence boundary Service depends on for challenge
+// nonces. Its three unexported methods match InMemoryNonceStore's own
+// pre-existing method set exactly (kept unexported — only types in this
+// package, sessionauth, can implement it: InMemoryNonceStore here and
+// RedisNonceStore in redis_nonce_store.go). Exported as a named type
+// (unlike Permissions'/Storage's unexported-method-interface convention)
+// because NewService's signature must name it directly — see
+// docs/DECISION_LOG.md's Batch C entry.
+type NonceStore interface {
+	put(nonce string, rec nonceRecord)
+	peek(nonce, identityRef, deviceID string, now time.Time) bool
+	consumeIfValid(nonce, identityRef, deviceID string, now time.Time) bool
+}
+
+// SessionStore is the persistence boundary Service depends on for issued
+// sessions. Its seven unexported methods match InMemorySessionStore's own
+// pre-existing method set exactly (kept unexported — only types in this
+// package can implement it: InMemorySessionStore here and
+// PostgresSessionStore in postgres_session_store.go).
+type SessionStore interface {
+	put(sess Session)
+	get(token string) (Session, bool)
+	touchLastUsed(token string, nowUnix int64)
+	delete(token string)
+	deleteAllForIdentity(identityRef string) int
+	listActiveForIdentity(identityRef string, nowUnix int64) []Session
+	listAllForIdentity(identityRef string) []Session
+}
 
 // --- nonce store ---
 
@@ -36,15 +73,15 @@ type nonceRecord struct {
 	// grow unboundedly from consumed-but-kept entries.
 }
 
-// nonceStore is a goroutine-safe, process-local store for outstanding
-// challenge nonces.
-type nonceStore struct {
+// InMemoryNonceStore is a goroutine-safe, process-local store for
+// outstanding challenge nonces.
+type InMemoryNonceStore struct {
 	mu     sync.Mutex
 	nonces map[string]nonceRecord
 }
 
-func newNonceStore() *nonceStore {
-	return &nonceStore{nonces: make(map[string]nonceRecord)}
+func NewInMemoryNonceStore() *InMemoryNonceStore {
+	return &InMemoryNonceStore{nonces: make(map[string]nonceRecord)}
 }
 
 // put registers a freshly issued nonce. Overwriting an existing key would
@@ -53,7 +90,7 @@ func newNonceStore() *nonceStore {
 // an error, since a collision would already mean an issued-but-unconsumed
 // nonce's identity/device binding is unrelated to the birthday-paradox
 // analysis a capability engineer would need to treat this as a real risk.
-func (s *nonceStore) put(nonce string, rec nonceRecord) {
+func (s *InMemoryNonceStore) put(nonce string, rec nonceRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nonces[nonce] = rec
@@ -66,7 +103,7 @@ func (s *nonceStore) put(nonce string, rec nonceRecord) {
 // before resolving the device or verifying a signature, on a nonce that is
 // obviously already invalid. This is deliberately NOT the operation that
 // provides the anti-replay guarantee — see consumeIfValid below for that.
-func (s *nonceStore) peek(nonce, identityRef, deviceID string, now time.Time) bool {
+func (s *InMemoryNonceStore) peek(nonce, identityRef, deviceID string, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.nonces[nonce]
@@ -93,7 +130,7 @@ func (s *nonceStore) peek(nonce, identityRef, deviceID string, now time.Time) bo
 // ever win this call; the loser gets a false return and IssueSession
 // rejects it with ErrInvalidNonce, never issuing a second session for the
 // same proof.
-func (s *nonceStore) consumeIfValid(nonce, identityRef, deviceID string, now time.Time) bool {
+func (s *InMemoryNonceStore) consumeIfValid(nonce, identityRef, deviceID string, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.nonces[nonce]
@@ -113,18 +150,18 @@ func (s *nonceStore) consumeIfValid(nonce, identityRef, deviceID string, now tim
 
 // --- session store ---
 
-// sessionStore is a goroutine-safe, process-local store for issued
+// InMemorySessionStore is a goroutine-safe, process-local store for issued
 // sessions, keyed by session_token.
-type sessionStore struct {
+type InMemorySessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]Session
 }
 
-func newSessionStore() *sessionStore {
-	return &sessionStore{sessions: make(map[string]Session)}
+func NewInMemorySessionStore() *InMemorySessionStore {
+	return &InMemorySessionStore{sessions: make(map[string]Session)}
 }
 
-func (s *sessionStore) put(sess Session) {
+func (s *InMemorySessionStore) put(sess Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[sess.SessionToken] = sess
@@ -135,7 +172,7 @@ func (s *sessionStore) put(sess Session) {
 // concern: ValidateSession/resolveCaller check ExpiresAtUnix against the
 // current time; ExportSessions deliberately wants even expired-but-not-
 // revoked sessions, see listAllForIdentity).
-func (s *sessionStore) get(token string) (Session, bool) {
+func (s *InMemorySessionStore) get(token string) (Session, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[token]
@@ -145,7 +182,7 @@ func (s *sessionStore) get(token string) (Session, bool) {
 // touchLastUsed updates LastUsedAtUnix for an existing session. A no-op if
 // the token is unknown (defensive; callers only invoke this after a
 // successful get/validate).
-func (s *sessionStore) touchLastUsed(token string, nowUnix int64) {
+func (s *InMemorySessionStore) touchLastUsed(token string, nowUnix int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[token]
@@ -159,7 +196,7 @@ func (s *sessionStore) touchLastUsed(token string, nowUnix int64) {
 // delete removes a session outright — revocation is real and immediate
 // (Art. 7): once deleted, no subsequent ValidateSession call can ever
 // resolve this token again, not "valid until natural expiry."
-func (s *sessionStore) delete(token string) {
+func (s *InMemorySessionStore) delete(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, token)
@@ -167,7 +204,7 @@ func (s *sessionStore) delete(token string) {
 
 // deleteAllForIdentity removes every session belonging to identityRef and
 // reports how many were removed — backs RevokeAllSessions.
-func (s *sessionStore) deleteAllForIdentity(identityRef string) int {
+func (s *InMemorySessionStore) deleteAllForIdentity(identityRef string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	count := 0
@@ -183,7 +220,7 @@ func (s *sessionStore) deleteAllForIdentity(identityRef string) int {
 // listActiveForIdentity returns every currently-unexpired session for
 // identityRef — backs ListActiveSessions, which is explicitly a "currently
 // active" transparency view (charter §3), not a full history.
-func (s *sessionStore) listActiveForIdentity(identityRef string, nowUnix int64) []Session {
+func (s *InMemorySessionStore) listActiveForIdentity(identityRef string, nowUnix int64) []Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Session
@@ -200,7 +237,7 @@ func (s *sessionStore) listActiveForIdentity(identityRef string, nowUnix int64) 
 // backs ExportSessions, which per charter §3 exports "every one of the
 // caller's own sessions" as a durable record, not just the live/active
 // subset ListActiveSessions shows.
-func (s *sessionStore) listAllForIdentity(identityRef string) []Session {
+func (s *InMemorySessionStore) listAllForIdentity(identityRef string) []Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Session

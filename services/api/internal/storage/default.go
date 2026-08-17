@@ -24,7 +24,13 @@ const (
 // — NOT called from main.go by this capability-engineer, per the standing
 // "no unauthenticated requesting_subject capability reaches the network
 // perimeter yet" rule (see http.go's Mount doc comment).
-func NewFilesystemService(checker PermissionChecker, audit AuditEmitter) (*Service, error) {
+//
+// store is taken as the first parameter and passed straight through to
+// NewService, unexamined — see NewService's doc comment for why (Store
+// interface introduction, docs/DECISION_LOG.md "Storage: Store interface
+// introduced, PostgresStore added"). Production wiring is expected to pass
+// NewPostgresStore(pool); tests may pass NewInMemoryStore().
+func NewFilesystemService(store Store, checker PermissionChecker, audit AuditEmitter) (*Service, error) {
 	defaultBackend, err := NewFilesystemBackend(DefaultDataDir(PolicyLocalDefault))
 	if err != nil {
 		return nil, fmt.Errorf("storage: constructing default backend: %w", err)
@@ -48,5 +54,5 @@ func NewFilesystemService(checker PermissionChecker, audit AuditEmitter) (*Servi
 			Backend:     secondaryBackend,
 		},
 	}
-	return NewService(policies, checker, audit)
+	return NewService(store, policies, checker, audit)
 }

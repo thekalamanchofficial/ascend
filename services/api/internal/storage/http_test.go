@@ -57,7 +57,7 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	backend := newFakeBackend(true, "fake")
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestMount_StoreAndRetrieveBlob(t *testing.T) {
 	backend := newFakeBackend(true, "fake")
 	checker := newFakePermissionChecker(true)
 	audit := newFakeAuditEmitter()
-	svc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
+	svc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, checker, audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestMount_StoreAndRetrieveBlob(t *testing.T) {
 func TestMount_RetrieveBlobPermissionDenied_Returns403(t *testing.T) {
 	backend := newFakeBackend(true, "fake")
 	audit := newFakeAuditEmitter()
-	allowSvc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, newFakePermissionChecker(true), audit)
+	allowSvc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, newFakePermissionChecker(true), audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestMount_RetrieveBlobPermissionDenied_Returns403(t *testing.T) {
 		t.Fatalf("StoreBlob: %v", err)
 	}
 
-	denySvc, err := NewService([]Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, newFakePermissionChecker(false), audit)
+	denySvc, err := NewService(NewInMemoryStore(), []Policy{{ID: "policy-a", DisplayName: "A", Description: "d", Backend: backend}}, newFakePermissionChecker(false), audit)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
