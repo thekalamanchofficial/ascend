@@ -1954,3 +1954,19 @@ Two unrelated environment issues surfaced and were resolved along the way, neith
 
 ---
 
+### 2026-08-18 — File Objects contract amendment: ListFileObjects
+
+**Decision:** Founder's next-screen intent (see the "how do completed capabilities fit together" conversation, this date) is a personal file vault + identity_ref-based sharing, built entirely on already-`stable` capabilities — no Messaging/Discovery charter needed for this pass. Investigating File Objects' actual routes (not just the charter prose) found a real, blocking gap: no RPC anywhere lets a caller discover which `file_object_id`s exist for them — every other operation requires already knowing one. A "my files" screen was structurally impossible against the current contract, same category of gap as `RevokeSessionsForDevice`.
+
+Added `ListFileObjects(owner, requesting_subject) -> [file_object]` to `docs/capabilities/file-objects.charter.md` §3, scoped deliberately narrow: self-only (`requesting_subject == owner`), mirroring Storage's existing `ExportAllBlobs` precedent exactly — no `CheckPermission`/Permissions involvement at all, since "list everything I own" is a right-to-see-your-own-stuff operation, not a shareable read. Reuses the existing `file_object` return shape unchanged (already confirmed leak-free of `blob_ref` by §6 point 8 — no new field, no new leak path). Deliberately does **not** solve "files shared to me" — that needs a reverse-index capability on Permissions' side that doesn't exist today, tracked as a new §7 open question rather than folded into this amendment, keeping this change narrowly scoped to File Objects' own interface (Art. 10). Also corrected a stale §8 line claiming File Objects wasn't wired into `main.go` (it was, 2026-08-16).
+
+**Rationale:** Same reasoning as the `RevokeSessionsForDevice` amendment — makes a genuinely usable "my files" screen possible rather than shipping a client-side-only workaround (remembering IDs locally) that would silently break on reinstall/new device and couldn't discover files shared to the user anyway, which the founder explicitly wants working.
+
+**Article(s) invoked:** Art. 1 (a user should be able to see everything they own, not just what their current device happens to remember), Art. 10 (scoped to avoid crossing into Permissions' own interface), Art. 17 (closes a real, structural gap — a files vault cannot exist without this).
+
+**Made by:** Chief Architect (charter amendment), Founder (the decision to amend rather than ship a client-side workaround).
+
+**Guardian gate:** pending — see charter §8 for the amendment-specific table.
+
+---
+
