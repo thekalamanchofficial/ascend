@@ -23,7 +23,7 @@
 import * as crypto from "../../capabilities/crypto";
 import * as identity from "../../capabilities/identity";
 import * as sessionauth from "../../capabilities/sessionauth";
-import { setAuthToken } from "../../api/httpClient";
+import { setAuthToken, ApiError } from "../../api/httpClient";
 import { logAuditEvent } from "../../capabilities/identity/audit";
 import { saveLocalIdentity, saveLocalSession, loadLocalIdentity, loadLocalSession } from "./localSession";
 import type { LocalIdentityRecord, LocalSessionRecord } from "./localSession";
@@ -304,13 +304,39 @@ export async function resumeSession(): Promise<{ identity: LocalIdentityRecord; 
 // revokeSessionsForDevice failure is surfaced as a thrown error, not
 // swallowed, so the caller (DevicesScreen) can tell the user the removal
 // was only partially applied rather than reporting false success.
+//
+// Retry-recoverable (fixed 2026-08-18, Security Steward implementation-gate
+// finding — see docs/DECISION_LOG.md): Identity.RevokeDevice is not
+// idempotent (a second call for an already-revoked device returns 404
+// ErrDeviceNotFound), so a naive retry after a first attempt's
+// revokeSessionsForDevice call failed (device revoked, sessions not yet
+// cleared) would fail immediately on the retry's revokeDevice call and
+// never reach revokeSessionsForDevice again — leaving a bounded-but-real
+// residual session window with no in-flow remedy. A 404 from revokeDevice
+// is therefore treated as an already-satisfied precondition, not a
+// failure: this call proceeds to revokeSessionsForDevice regardless,
+// re-fetching the current epoch via the public resolveIdentity lookup
+// (this device's removal already happened, we just don't have its return
+// value from this call) so the response shape stays consistent.
 // ---------------------------------------------------------------------------
 export async function removeDevice(
   identityRef: string,
   deviceId: string,
   sessionToken: string,
 ): Promise<{ epoch: number; sessionsRevoked: number }> {
-  const revokeDeviceResp = await identity.revokeDevice({ identityRef, deviceId }, sessionToken);
+  let epoch: number;
+  try {
+    epoch = (await identity.revokeDevice({ identityRef, deviceId }, sessionToken)).epoch;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) {
+      // Already revoked (e.g. a retry after a prior partial failure) —
+      // satisfied precondition, not an error. Proceed to make sure this
+      // device's sessions are actually cleared.
+      epoch = (await identity.resolveIdentity({ identityRef })).publicIdentity.epoch;
+    } else {
+      throw err;
+    }
+  }
   const revokeSessionsResp = await sessionauth.revokeSessionsForDevice({
     callerSessionToken: sessionToken,
     deviceId,
@@ -318,10 +344,10 @@ export async function removeDevice(
   logAuditEvent("onboarding_device_removed", {
     identityRef,
     deviceId,
-    epochAfter: String(revokeDeviceResp.epoch),
+    epochAfter: String(epoch),
     sessionsRevoked: String(revokeSessionsResp.sessionsRevoked),
   });
-  return { epoch: revokeDeviceResp.epoch, sessionsRevoked: revokeSessionsResp.sessionsRevoked };
+  return { epoch, sessionsRevoked: revokeSessionsResp.sessionsRevoked };
 }
 
 // ---------------------------------------------------------------------------

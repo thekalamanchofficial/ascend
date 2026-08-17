@@ -1884,3 +1884,17 @@ The dispatched capability-engineer hit its own session/API limit mid-task, immed
 
 ---
 
+### 2026-08-18 — RevokeSessionsForDevice implementation gate: independent PASS, and a retry-recoverability fix
+
+**Decision:** Security Steward independently re-verified the implementation above (a first attempt was cut off mid-review by a platform session-limit error the day before, not by any finding — this is that review actually completing, not a second opinion after a block). It reproduced the required mutation test itself rather than trusting the prior report, and in doing so found the working tree still held live, uncommitted debris from the crashed prior capability-engineer session (`postgres_session_store.go`'s `putIfDeviceGenerationUnchanged` reverted to a blind write, a stray `.orig.bak`, and a leftover probe test) — cleaned it up, restored to HEAD, verified byte-identical before proceeding. Verdict: **PASS**, full reasoning in the charter's §8 "Implementation merge gate" table.
+
+One real, non-blocking finding, fixed the same day: `apps/mobile`'s `removeDevice` correctly surfaces a `revokeSessionsForDevice` failure rather than swallowing it, but `Identity.RevokeDevice` is not idempotent (a second call for an already-revoked device returns `404`/`ErrDeviceNotFound`) — so a user retrying "remove device" after exactly that partial failure (device unbound, sessions not yet cleared) would have the retry's own `revokeDevice` call fail immediately, never reaching `revokeSessionsForDevice` again, leaving a bounded (≤30 min, non-renewable — the device can't get a new session, only its already-issued one lingers) residual session with no in-flow remedy. Fixed: `removeDevice` now catches a `404` from `revokeDevice` specifically, treats it as an already-satisfied precondition (not a failure), re-fetches the current epoch via the public `resolveIdentity` lookup for response-shape consistency, and proceeds to `revokeSessionsForDevice` regardless — making the composed action genuinely retry-safe.
+
+**Rationale:** Security Steward's own standard, applied to itself: don't take a report on faith when reproducing the check directly is cheap and catches real drift (here, literal uncommitted mutation debris from a crashed session that could otherwise have been mistaken for the shipped state). The retry-recoverability gap is a real Art. 7 edge case (a user's ownership-restoring action should be safely repeatable, not silently one-shot) worth closing immediately rather than deferring, since the fix was small and well-scoped.
+
+**Article(s) invoked:** Art. 7 (a repeated user action to cut off access should be safe to retry, not trap the user in a partially-applied state), Art. 5 (the guardian gate itself — verify, don't assert).
+
+**Made by:** Security Steward (independent implementation gate), Chief Architect (the retry-recoverability fix, verified: `apps/mobile` typecheck/test clean, all 6 constitution checks pass).
+
+---
+
