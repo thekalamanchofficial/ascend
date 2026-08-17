@@ -1926,3 +1926,17 @@ Fixed by creating `apps/mobile/index.ts` (a plain local file mirroring `node_mod
 
 ---
 
+### 2026-08-18 — Added `apps/mobile/metro.config.js`: pin `projectRoot`, fixing a monorepo-detection asset-resolution bug
+
+**Decision:** Added an explicit `metro.config.js` (`getDefaultConfig(__dirname)` from `expo/metro-config`, no other overrides) to `apps/mobile`.
+
+**Rationale:** Found live, via `adb logcat` on a real Android emulator, while diagnosing a still-black app screen (post entry-point fix, previous two entries): Expo Go's LogBox error overlay failed to load its own `close.png` icon, Metro reporting `./../../node_modules/react-native/Libraries/LogBox/UI/LogBoxImages/close.png could not be found in the project root or any watch folder`. Root cause: with no `metro.config.js`, Expo's default config walks upward from `apps/mobile` looking for a workspace root, finds this repo's `.git` directory two levels up (`ascend/`), and — despite `ascend/` having no root `package.json` or `node_modules` of its own; this is a plain git repo with `apps/mobile` nested inside it, not an npm/pnpm workspace — treats it as a monorepo root, widening `watchFolders` and computing asset paths relative to the wrong base, producing the doubled `../..` and a genuine "not found." Confirmed the fix live: a throwaway `expo start --port 8091 --clear` instance's manifest, JS bundle (`index.ts.bundle`), and the specific previously-404ing LogBox asset URL all returned `200` after adding the config; killed before touching the founder's own running dev server.
+
+This was masking, not causing, the actual crash under investigation — with LogBox itself unable to render, the real underlying error (a `ClassCastException` inside Expo Go's own bundled, unused-by-this-project `ExpoReanimatedPackage`, unrelated to any code in this repo) had no way to surface on-screen, presenting as a plain black screen with no diagnostic text visible to the founder. Fixing this is a precondition for actually seeing that error, not a fix for it — tracked as the next thing to diagnose.
+
+**Article(s) invoked:** Art. 12 (a broken error-reporting path is worse than the error itself — the founder was looking at a black screen with no way to know why).
+
+**Made by:** Chief Architect.
+
+---
+
