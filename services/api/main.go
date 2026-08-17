@@ -4,10 +4,13 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 
 	"github.com/ascend/services/api/internal/audit"
 	"github.com/ascend/services/api/internal/fileobjects"
@@ -34,6 +37,35 @@ func limitRequestBody(next http.Handler) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// corsAllowedOrigins returns the origins this server will answer CORS
+// preflight/actual requests for. This server has no real deployment yet
+// (CLAUDE.md guardrails: no real deployment is performed by this session),
+// so the default is scoped to the handful of localhost origins Expo's web
+// target and Metro's own dev server actually use — never a wildcard, never
+// a real domain. Native iOS/Android RN clients don't go through a browser
+// CORS check at all, so this only matters for `expo start --web` and
+// browser-based dev tooling. Override via ASCEND_CORS_ALLOWED_ORIGINS
+// (comma-separated) for any environment where the default list is wrong —
+// this must be revisited with a real, non-localhost allowlist (and a
+// documented TLS-termination stance, tracked in
+// docs/CAPABILITY_REGISTRY.md) before any real deployment happens.
+func corsAllowedOrigins() []string {
+	if v := os.Getenv("ASCEND_CORS_ALLOWED_ORIGINS"); v != "" {
+		var origins []string
+		for o := range strings.SplitSeq(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				origins = append(origins, o)
+			}
+		}
+		return origins
+	}
+	return []string{
+		"http://localhost:8081",  // Expo/Metro dev server default
+		"http://localhost:19006", // legacy Expo web default port
+		"http://localhost:3000",
+	}
 }
 
 // main wires the HTTP server. Capability handlers are mounted here once
@@ -174,6 +206,13 @@ func newRouter(plat *platform.Platform) http.Handler {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(limitRequestBody)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   corsAllowedOrigins(),
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: false, // sessions are bearer-token, not cookie-based (see sessionauth) — no credentialed CORS needed
+		MaxAge:           300,
+	}))
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

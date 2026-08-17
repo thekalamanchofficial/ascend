@@ -15,6 +15,38 @@ Append-only. Every non-trivial decision made by the Chief Architect, a guardian,
 
 ---
 
+### 2026-08-17 — Dev-scoped CORS on services/api, for expo web/UI dev tooling
+
+**Decision:** Added `github.com/go-chi/cors` middleware to `services/api/main.go`, scoped by default to `http://localhost:8081`/`19006`/`3000` (Expo/Metro dev ports), overridable via `ASCEND_CORS_ALLOWED_ORIGINS`. `AllowCredentials: false`. Live-verified by both the Chief Architect (real curl preflight against the running binary: allowed origin gets `Access-Control-Allow-Origin` echoed, disallowed origin gets no CORS headers, native/no-Origin requests unaffected) and Security Steward (see gate below).
+
+**Rationale:** `expo start --web` and any browser-based dev tooling need this to reach `localhost:8080` at all; native iOS/Android RN clients never hit a browser CORS check, so this only unblocks web-target dev, not a production concern yet.
+
+**Article(s) invoked:** Art. 7 (verified this doesn't touch keys/encryption/permissions/storage and doesn't silently resolve the still-open production TLS-termination/CORS-allowlist item tracked in `docs/CAPABILITY_REGISTRY.md`).
+
+**Made by:** Chief Architect.
+
+**Guardian gate:**
+
+| Guardian | Verdict | Notes |
+|---|---|---|
+| Security Steward | ✅ pass | Independently verified `AllowCredentials: false` against the actual auth mechanism by reading `sessionauth/http.go`/`token.go` and grepping the whole service for cookie usage (none found — bearer-token-only). Confirmed CORS middleware ordering doesn't bypass the `requireVerifiedCaller` auth groups. Confirmed origin allowlist has no wildcard/real domain and the env-var override has no silent-widening fallback path. Two non-blocking follow-ups adopted immediately (empty-string filtering on the override, noted here) and one deferred (`ExposedHeaders` for cross-origin export header reads — no browser export UI exists yet). |
+
+---
+
+### 2026-08-17 — UI integration readiness verification
+
+**Decision (finding, not a design choice):** Before starting mobile UI work, verified the backend live rather than trusting the registry: `go build ./...` clean, `go test ./...` passes across every capability package, and the Postgres/Redis/MinIO Docker stack is up and healthy. All 7 chartered capabilities are confirmed genuinely network-reachable, matching `docs/CAPABILITY_REGISTRY.md`'s claims — no drift found on the backend itself.
+
+Found the actual gaps are on the client-integration surface, not the backend: (1) `packages/contracts/gen/ts` is stale/incomplete — only crypto/identity/permissions/audit have generated TS types, storage/fileobjects/sessionauth have none, and `buf` isn't installed locally to regenerate. Checked whether this blocks UI work and found it doesn't: every backend capability, including the three `packages/contracts/README.md` claims use codegen, actually hand-mirrors the frozen proto shapes instead (no `gen/go` imports found in `internal/storage` or `internal/fileobjects`; `internal/sessionauth/types.go` documents this explicitly). `apps/mobile/src/capabilities/crypto/types.ts` already follows this same hand-mirrored pattern. So mobile capability clients should hand-write TS types from the frozen `.proto` files, same precedent, not block on codegen. `packages/contracts/README.md`'s codegen-usage claim is inaccurate for 3 of 7 capabilities and should be corrected separately. (2) `apps/mobile/src` has no networking code at all yet — no fetch wrapper, no base URL config, no TanStack Query wiring for any server-backed capability. (3) No CORS middleware in `services/api` — fine for native, blocks `expo start --web`. (4) `docs/capabilities/session-authentication.charter.md` still states it isn't wired into `main.go`, stale since the 2026-08-16 wiring pass.
+
+**Rationale:** Article 5 applies to this session's own audit trail — a "yes it's ready" or "no it's not" answer needs to be a checked fact, not an assumption carried over from the registry's own prose.
+
+**Article(s) invoked:** Art. 5 (explainability — verify, don't assert), Art. 10 (modularity — confirming client-side types stay hand-mirrored from frozen contracts, not a parallel invented shape).
+
+**Made by:** Chief Architect.
+
+---
+
 ### 2026-07-06 — Contracts source of truth: Protocol Buffers (via Buf)
 
 **Decision:** `packages/contracts` defines capability interfaces in Protocol Buffers, with Buf for linting, breaking-change detection, and codegen to Go, TypeScript, and Python.
