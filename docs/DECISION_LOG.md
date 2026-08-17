@@ -2012,3 +2012,17 @@ One environment artifact worth recording, not a code defect: an initial `go run 
 
 ---
 
+### 2026-08-18 — ListFileObjects implementation-gate: independent PASS
+
+**Decision:** Security Steward independently re-verified the `ListFileObjects` implementation above against its own design-stage veto, without trusting the implementing capability-engineer's report. Confirmed by direct code reading that the HTTP-level `RequestingSubject == caller` check runs and rejects before the service layer is ever reached (the exact structural fix the veto required — not the vulnerable service-level-only shape of the original draft), and that the service-level `RequestingSubject == Owner` check remains independently present. Ran the specific bypass-scenario test itself (`TestHTTP_ListFileObjects_CallerMismatchRejectedDespiteServiceFieldsMatching`) and its siblings — all pass. Went further than the engineer's own verification: brought up a real `go run .` instance against the live database stack, drove genuine `CreateIdentity`/Ed25519-signed `IssueSession` calls for two distinct identities, reproduced the exact bypass attempt over real HTTP (`403`, not `200`), and independently confirmed via direct `psql` query that both rejections were durably recorded in the live `audit_events` table with the correct actor/resource. Constitution Warden's implementation-gate row marked N/A (mechanical CI sufficient), same reasoning as `RevokeSessionsForDevice`'s implementation gate — no new qualitative judgment call beyond the design gate.
+
+**Rationale:** The same discipline applied throughout this session: a subagent's or engineer's own report of success is a starting point, not evidence, when the finding was security-critical enough to have been vetoed once already.
+
+**Article(s) invoked:** Art. 5 (verified, not assumed), Art. 7.
+
+**Made by:** Security Steward (independent implementation gate).
+
+**Status: `ListFileObjects` is fully implemented, tested, live-verified, and guardian-gated at both design and implementation stages. Ready for mobile client integration.**
+
+---
+
