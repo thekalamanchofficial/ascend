@@ -71,9 +71,7 @@ export function DevicesScreen() {
   function confirmRemoveDevice(device: Device) {
     Alert.alert(
       "Remove device",
-      `Remove "${device.name}"? This revokes its Identity binding. Note: any session already issued to this ` +
-        `device remains valid until it naturally expires — see this pass's known gap, documented in ` +
-        `identity/index.ts's revokeDevice and docs/DECISION_LOG.md.`,
+      `Remove "${device.name}"? This revokes its binding and signs it out of every active session immediately.`,
       [
         { text: "Cancel", style: "cancel" },
         {

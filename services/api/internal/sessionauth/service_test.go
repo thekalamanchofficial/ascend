@@ -633,6 +633,270 @@ func TestIssueSession_AuditEmitErrorIsSurfaced_NotDiscarded(t *testing.T) {
 	}
 }
 
+func TestRevokeSessionsForDevice_OnlyRevokesTargetDeviceOnCallersOwnIdentity(t *testing.T) {
+	resolver := newFakeDeviceResolver()
+	audit := newFakeAuditEmitter()
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
+
+	_, privA1 := newTestIdentity(t, resolver, "id-alice", "dev-a1")
+	_, privA2 := newTestIdentity(t, resolver, "id-alice", "dev-a2")
+	_, privB := newTestIdentity(t, resolver, "id-bob", "dev-b1")
+
+	sessA1 := issueValidSession(t, svc, privA1, "id-alice", "dev-a1")
+	sessA2 := issueValidSession(t, svc, privA2, "id-alice", "dev-a2")
+	sessB := issueValidSession(t, svc, privB, "id-bob", "dev-b1")
+
+	// Alice revokes ONLY dev-a1's sessions, authorized via her own token
+	// (which happens to be dev-a1's own token here — RevokeSessionsForDevice
+	// authorizes off the CALLER's identity, not off "not the target
+	// device's own token", so this is a legitimate self-revocation).
+	result, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: sessA1.SessionToken,
+		DeviceID:           "dev-a1",
+	})
+	if err != nil {
+		t.Fatalf("RevokeSessionsForDevice: %v", err)
+	}
+	if result.SessionsRevoked != 1 {
+		t.Fatalf("expected exactly 1 session revoked for dev-a1, got %d", result.SessionsRevoked)
+	}
+
+	// dev-a1's session is gone...
+	va1, err := svc.ValidateSession(ValidateSessionRequest{SessionToken: sessA1.SessionToken})
+	if err != nil {
+		t.Fatalf("ValidateSession(a1): %v", err)
+	}
+	if va1.Valid {
+		t.Fatal("expected dev-a1's session to be invalid after RevokeSessionsForDevice")
+	}
+
+	// ...but Alice's OTHER device (dev-a2) is untouched — this is the
+	// per-device scoping RevokeAllSessions cannot provide.
+	va2, err := svc.ValidateSession(ValidateSessionRequest{SessionToken: sessA2.SessionToken})
+	if err != nil {
+		t.Fatalf("ValidateSession(a2): %v", err)
+	}
+	if !va2.Valid {
+		t.Fatal("expected dev-a2's session to remain valid — RevokeSessionsForDevice must not cross devices")
+	}
+
+	// ...and Bob's completely unrelated identity is untouched — there is no
+	// identity_ref field on RevokeSessionsForDeviceRequest at all (frozen
+	// contract), so the only identity this call could possibly have
+	// affected is the one Alice's own token resolves to, regardless of
+	// what device_id was supplied.
+	vb, err := svc.ValidateSession(ValidateSessionRequest{SessionToken: sessB.SessionToken})
+	if err != nil {
+		t.Fatalf("ValidateSession(bob): %v", err)
+	}
+	if !vb.Valid {
+		t.Fatal("Bob's session must remain valid — RevokeSessionsForDevice must never cross identities")
+	}
+
+	if len(audit.callsFor("sessionauth.device_sessions_revoked")) != 1 {
+		t.Fatal("expected exactly one device_sessions_revoked audit event")
+	}
+}
+
+func TestRevokeSessionsForDevice_InvalidCallerTokenRejected(t *testing.T) {
+	resolver := newFakeDeviceResolver()
+	audit := newFakeAuditEmitter()
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
+
+	_, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: "not-a-real-token",
+		DeviceID:           "dev-x",
+	})
+	if !errors.Is(err, ErrSessionInvalid) {
+		t.Fatalf("expected ErrSessionInvalid for an unresolvable caller token, got: %v", err)
+	}
+}
+
+func TestRevokeSessionsForDevice_ZeroSessionsIsNotAnError(t *testing.T) {
+	// A device with no active sessions at all (e.g. already revoked, or
+	// never had one issued) must report 0, not fail — the composed mobile
+	// "remove device" action calls this unconditionally after
+	// Identity.RevokeDevice, including for a device that happens to have
+	// no live session at that moment.
+	resolver := newFakeDeviceResolver()
+	audit := newFakeAuditEmitter()
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
+
+	_, privA := newTestIdentity(t, resolver, "id-alice", "dev-a1")
+	sessA := issueValidSession(t, svc, privA, "id-alice", "dev-a1")
+
+	result, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: sessA.SessionToken,
+		DeviceID:           "dev-never-had-a-session",
+	})
+	if err != nil {
+		t.Fatalf("RevokeSessionsForDevice: %v", err)
+	}
+	if result.SessionsRevoked != 0 {
+		t.Fatalf("expected 0 sessions revoked, got %d", result.SessionsRevoked)
+	}
+}
+
+func TestIssueSession_SucceedsWithFreshChallengeIssuedAfterAnEarlierUnrelatedRevoke(t *testing.T) {
+	// A device whose sessions were revoked (RevokeSessionsForDevice) but
+	// whose Identity binding was NOT touched remains a legitimately bound
+	// device — it must still be able to obtain a brand new session
+	// afterward, same as any other bound device. This is deliberately the
+	// opposite expectation of an earlier, over-strict version of this test
+	// (see docs/DECISION_LOG.md, this capability's "RevokeSessionsForDevice
+	// implementation" entry, for the correction): the charter's atomicity
+	// requirement (§3) only covers a session "concurrently in-flight" with
+	// a revoke call, i.e. genuinely overlapping in time — see
+	// TestRevokeSessionsForDevice_AtomicAgainstConcurrentIssueSession for
+	// that actual guarantee, deterministically forced rather than left to
+	// scheduler luck. A request that starts strictly AFTER a revoke has
+	// already returned is a new authentication event, not a survivor of
+	// the race the charter guards against; RevokeSessionsForDevice's own
+	// job (charter §3) is narrower than blocking a device outright — that
+	// is Identity.RevokeDevice's job, and §5's composed "remove device"
+	// action calls RevokeDevice first specifically so a genuinely
+	// unwanted device is blocked at IssueSession's step 2 (DeviceResolver)
+	// regardless of this generation mechanism.
+	resolver := newFakeDeviceResolver()
+	audit := newFakeAuditEmitter()
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
+
+	identityRef, deviceID := "id-jules", "dev-phone"
+	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
+
+	// A caller session on a different device, to authorize the revoke.
+	_, callerPriv := newTestIdentity(t, resolver, identityRef, "dev-caller")
+	callerSess := issueValidSession(t, svc, callerPriv, identityRef, "dev-caller")
+
+	// Revoke dev-phone's (currently nonexistent) sessions first, entirely
+	// unrelated to and finished well before the challenge below is even
+	// requested — establishing that dev-phone remains bound throughout.
+	if _, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: callerSess.SessionToken,
+		DeviceID:           deviceID,
+	}); err != nil {
+		t.Fatalf("RevokeSessionsForDevice: %v", err)
+	}
+
+	challenge, err := svc.GetSessionChallenge(GetSessionChallengeRequest{IdentityRef: identityRef, DeviceID: deviceID})
+	if err != nil {
+		t.Fatalf("GetSessionChallenge: %v", err)
+	}
+	msg := buildIssueSessionMessage(identityRef, deviceID, challenge.ChallengeNonce)
+	sig := ed25519.Sign(priv, msg)
+
+	resp, err := svc.IssueSession(IssueSessionRequest{
+		IdentityRef:    identityRef,
+		DeviceID:       deviceID,
+		ChallengeNonce: challenge.ChallengeNonce,
+		Proof:          sig,
+	})
+	if err != nil {
+		t.Fatalf("IssueSession: expected success for a still-bound device with a fresh challenge, got: %v", err)
+	}
+	if resp.SessionToken == "" {
+		t.Fatal("expected a non-empty session token")
+	}
+}
+
+// TestRevokeSessionsForDevice_AtomicAgainstConcurrentIssueSession is the
+// mutation-tested regression coverage the charter's atomicity requirement
+// (§3, RevokeSessionsForDevice amendment) explicitly demands: "verified the
+// same way at the implementation merge gate (mutation-testing the
+// serialization logic, not just a happy-path regression test)" — mirroring
+// TestIssueSession_ReplayRejected_ConcurrentDuplicateRequestsOnlyOneWins's
+// own precedent for nonce-consumption atomicity above.
+//
+// Invariant under test: an IssueSession call that reads the device's
+// generation BEFORE a RevokeSessionsForDevice call for that same device
+// commits, but attempts its own commit AFTER that revoke has already
+// returned to its caller, must be rejected — and no session may exist for
+// the device afterward. This is the actual "concurrently in-flight" case
+// the charter's atomicity requirement (§3) names, forced deterministically
+// via testHookAfterObserveGeneration rather than left to two goroutines'
+// scheduling luck: an earlier, un-synchronized version of this test (see
+// docs/DECISION_LOG.md, this capability's "RevokeSessionsForDevice
+// implementation" entry, for the correction) failed on trial 0 or 1 nearly
+// every run — not because the atomicity mechanism was broken, but because
+// unsynchronized goroutines running trivial non-blocking work overwhelmingly
+// settle into "the revoke finishes entirely before IssueSession's goroutine
+// is even scheduled," which produces a legitimate fresh session (see
+// TestIssueSession_SucceedsWithFreshChallengeIssuedAfterAnEarlierUnrelatedRevoke),
+// not a race — the old test was asserting the wrong invariant, not
+// detecting a real bug. This version instead pins the exact interleaving
+// that must be safe: IssueSession's generation-read strictly precedes the
+// revoke's commit, and IssueSession's own commit strictly follows it.
+func TestRevokeSessionsForDevice_AtomicAgainstConcurrentIssueSession(t *testing.T) {
+	resolver := newFakeDeviceResolver()
+	audit := newFakeAuditEmitter()
+	svc := NewService(NewInMemoryNonceStore(), NewInMemorySessionStore(), resolver, audit)
+
+	identityRef, deviceID := "id-racer", "dev-racer"
+	_, priv := newTestIdentity(t, resolver, identityRef, deviceID)
+
+	// A caller session on a different device, to authorize the racing
+	// RevokeSessionsForDevice call and the post-race cleanup check.
+	_, callerPriv := newTestIdentity(t, resolver, identityRef, "dev-caller")
+	callerSess := issueValidSession(t, svc, callerPriv, identityRef, "dev-caller")
+
+	challenge, err := svc.GetSessionChallenge(GetSessionChallengeRequest{IdentityRef: identityRef, DeviceID: deviceID})
+	if err != nil {
+		t.Fatalf("GetSessionChallenge: %v", err)
+	}
+	msg := buildIssueSessionMessage(identityRef, deviceID, challenge.ChallengeNonce)
+	sig := ed25519.Sign(priv, msg)
+
+	reachedHook := make(chan struct{})
+	releaseIssue := make(chan struct{})
+	t.Cleanup(func() { testHookAfterObserveGeneration = nil })
+	testHookAfterObserveGeneration = func() {
+		close(reachedHook)
+		<-releaseIssue
+	}
+
+	issueErrCh := make(chan error, 1)
+	go func() {
+		_, err := svc.IssueSession(IssueSessionRequest{
+			IdentityRef:    identityRef,
+			DeviceID:       deviceID,
+			ChallengeNonce: challenge.ChallengeNonce,
+			Proof:          sig,
+		})
+		issueErrCh <- err
+	}()
+
+	// Wait until IssueSession has read its generation snapshot (0) and is
+	// parked in the hook — only then run the revoke to completion, then
+	// release IssueSession to attempt its now-stale commit.
+	<-reachedHook
+	revokeResp, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: callerSess.SessionToken,
+		DeviceID:           deviceID,
+	})
+	if err != nil {
+		t.Fatalf("RevokeSessionsForDevice: %v", err)
+	}
+	if revokeResp.SessionsRevoked != 0 {
+		t.Fatalf("expected 0 sessions revoked (none existed yet), got %d", revokeResp.SessionsRevoked)
+	}
+	close(releaseIssue)
+
+	if err := <-issueErrCh; !errors.Is(err, ErrDeviceSessionsRevokedConcurrently) {
+		t.Fatalf("expected ErrDeviceSessionsRevokedConcurrently for the now-stale commit, got: %v", err)
+	}
+
+	cleanup, err := svc.RevokeSessionsForDevice(RevokeSessionsForDeviceRequest{
+		CallerSessionToken: callerSess.SessionToken,
+		DeviceID:           deviceID,
+	})
+	if err != nil {
+		t.Fatalf("cleanup RevokeSessionsForDevice: %v", err)
+	}
+	if cleanup.SessionsRevoked != 0 {
+		t.Fatalf("%d session(s) for %s/%s survived the race — atomicity violated", cleanup.SessionsRevoked, identityRef, deviceID)
+	}
+}
+
 func TestRevokeSession_UnknownTokenRejected(t *testing.T) {
 	resolver := newFakeDeviceResolver()
 	audit := newFakeAuditEmitter()

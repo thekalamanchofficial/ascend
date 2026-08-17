@@ -29,6 +29,14 @@ const (
 	DefaultChallengeNonceLifetime = 2 * time.Minute
 )
 
+// testHookAfterObserveGeneration is nil in production (a nil check guards
+// every call site, so this is a genuine no-op, not a disguised extension
+// point a real caller could ever reach) and set only by
+// TestRevokeSessionsForDevice_AtomicAgainstConcurrentIssueSession, to force
+// a deterministic overlap for that regression test — see IssueSession's
+// call site for the full rationale.
+var testHookAfterObserveGeneration func()
+
 // Service implements the seven SessionAuthService RPCs (sessionauth.proto)
 // against two injected storage seams (NonceStore, SessionStore — store.go)
 // and two injected non-storage seams (DeviceResolver, AuditEmitter) — see
@@ -146,6 +154,35 @@ func (s *Service) IssueSession(req IssueSessionRequest) (IssueSessionResponse, e
 
 	now := s.now()
 
+	// Captured at the very start of request processing, BEFORE any of the
+	// steps below (nonce peek/device-resolve/signature-verify/nonce-
+	// consume) — deliberately, not immediately before step 5's atomic
+	// commit. This is what makes the atomicity requirement (charter §3,
+	// RevokeSessionsForDevice amendment) genuinely close the race rather
+	// than merely narrowing it to the sliver of time between two adjacent
+	// store calls: a RevokeSessionsForDevice call for this device that
+	// runs to completion ANY TIME between this line and step 5's atomic
+	// commit below must cause that commit to fail, because this value will
+	// then be stale relative to the store's current generation. See step
+	// 5's own doc comment and store.go's SessionStore doc comment for the
+	// full design.
+	observedGeneration := s.sessions.currentDeviceGeneration(req.IdentityRef, req.DeviceID)
+
+	// Test-only synchronization point (nil/no-op in production — see its
+	// declaration below). Exists so the concurrency regression test
+	// (TestRevokeSessionsForDevice_AtomicAgainstConcurrentIssueSession) can
+	// force a genuine, deterministic overlap between this read and step 5's
+	// commit, instead of relying on Go's scheduler to maybe interleave two
+	// goroutines doing trivial non-blocking work — which it very often
+	// does not, making an un-synchronized version of that test flaky
+	// (observed: failing on trial 0 or 1 nearly every run, not because the
+	// atomicity mechanism was broken, but because the "revoke completes
+	// entirely before IssueSession's goroutine is even scheduled" ordering
+	// dominates and produces a legitimate fresh session, not a race).
+	if testHookAfterObserveGeneration != nil {
+		testHookAfterObserveGeneration()
+	}
+
 	// Step 1 (charter §3): nonce must exist, be unexpired, not already
 	// consumed. This is a fast-fail check, NOT the atomic anti-replay gate
 	// (see consumeIfValid at step 4) — a nonce that passes this check can
@@ -186,7 +223,21 @@ func (s *Service) IssueSession(req IssueSessionRequest) (IssueSessionResponse, e
 		return IssueSessionResponse{}, ErrInvalidNonce
 	}
 
-	// Step 5 (charter §3): create the new session record.
+	// Step 5 (charter §3, extended by the 2026-08-17 RevokeSessionsForDevice
+	// amendment's atomicity requirement — see docs/DECISION_LOG.md,
+	// "Session/Request Authentication contract amendment:
+	// RevokeSessionsForDevice"): create the new session record via an
+	// atomic commit gate, not a blind put, re-checking observedGeneration
+	// (captured at the top of this function) against the store's current
+	// generation for this device — atomically, under the same per-device
+	// serialization point revokeAllForDevice uses (store.go). A rejection
+	// here means a RevokeSessionsForDevice call for this exact device
+	// committed (and already returned success to its own caller) at some
+	// point during this request's processing — the charter's atomicity
+	// requirement working as intended, not a bug: no session for a
+	// just-revoked device may survive a RevokeSessionsForDevice call that
+	// has already returned, including one from a request that was
+	// concurrently in-flight past nonce/signature verification.
 	token := generateSessionToken()
 	expiresAt := now.Add(s.sessionLifetime).Unix()
 	sess := Session{
@@ -197,7 +248,10 @@ func (s *Service) IssueSession(req IssueSessionRequest) (IssueSessionResponse, e
 		ExpiresAtUnix:  expiresAt,
 		LastUsedAtUnix: now.Unix(),
 	}
-	s.sessions.put(sess)
+	if !s.sessions.putIfDeviceGenerationUnchanged(sess, observedGeneration) {
+		s.auditIssueRejected(req.IdentityRef, req.DeviceID, "device_sessions_revoked_concurrently")
+		return IssueSessionResponse{}, ErrDeviceSessionsRevokedConcurrently
+	}
 
 	if _, err := s.audit.Emit(req.IdentityRef, "sessionauth.session_issued",
 		ResourceRef{ResourceType: "identity_device", ResourceID: req.DeviceID},
@@ -366,6 +420,67 @@ func (s *Service) RevokeAllSessions(req RevokeAllSessionsRequest) (RevokeAllSess
 	}
 
 	return RevokeAllSessionsResponse{SessionsRevoked: int32(count)}, nil
+}
+
+// RevokeSessionsForDevice signs a single device out everywhere — the
+// per-device analog of RevokeAllSessions, added by the 2026-08-17 charter
+// amendment (docs/DECISION_LOG.md, "Session/Request Authentication
+// contract amendment: RevokeSessionsForDevice") to close the mobile
+// client's "remove this device" gap (session-authentication.charter.md
+// §5). Resolves caller_session_token via resolveCaller first (same
+// authorization shape as RevokeAllSessions/ListActiveSessions/
+// ExportSessions — never a bare identity_ref, device_id alone is never
+// sufficient authorization) and operates only on that resolved identity's
+// sessions for the given device_id — a caller can never revoke another
+// identity's device sessions no matter what device_id they supply.
+//
+// Atomicity (charter §3 amendment, Security Steward gate): sessions_revoked
+// is a completion guarantee, not a point-in-time snapshot count.
+// store.go's SessionStore.revokeAllForDevice guarantees no session for
+// device_id can remain live after this call returns success, including
+// one from a concurrently in-flight IssueSession for that same device —
+// see that method's doc comment and IssueSession's
+// putIfDeviceGenerationUnchanged commit gate above for the two halves of
+// this guarantee (whichever of the two operations' critical sections runs
+// first for a given device, the other is guaranteed to observe its
+// effect).
+//
+// Composition ordering (charter §5 amendment): the mobile client's "remove
+// this device" action calls Identity's RevokeDevice FIRST, then this RPC —
+// this service has no dependency on Identity to enforce that ordering
+// itself; it is a client-side composition requirement, satisfied by
+// apps/mobile/src/features/onboarding/onboarding.ts's removeDevice.
+//
+// ascend:mutates
+func (s *Service) RevokeSessionsForDevice(req RevokeSessionsForDeviceRequest) (RevokeSessionsForDeviceResponse, error) {
+	if req.DeviceID == "" {
+		return RevokeSessionsForDeviceResponse{}, fmt.Errorf("%w: device_id is required", ErrInvalidArgument)
+	}
+
+	now := s.now()
+	sess, ok := s.resolveCaller(req.CallerSessionToken, now)
+	if !ok {
+		_, _ = s.audit.Emit("", "sessionauth.revoke_sessions_for_device_rejected",
+			ResourceRef{ResourceType: "session_token_fingerprint", ResourceID: tokenFingerprint(req.CallerSessionToken)},
+			"sessionauth.revoke_sessions_for_device.invalid_caller_session",
+			map[string]string{"reason": "caller_session_token_invalid_expired_or_revoked", "device_id": req.DeviceID})
+		return RevokeSessionsForDeviceResponse{}, ErrSessionInvalid
+	}
+
+	count := s.sessions.revokeAllForDevice(sess.IdentityRef, req.DeviceID)
+
+	if _, err := s.audit.Emit(sess.IdentityRef, "sessionauth.device_sessions_revoked",
+		ResourceRef{ResourceType: "identity_device", ResourceID: req.DeviceID},
+		"sessionauth.revoke_sessions_for_device",
+		map[string]string{
+			"identity_ref":     sess.IdentityRef,
+			"device_id":        req.DeviceID,
+			"sessions_revoked": strconv.Itoa(count),
+		}); err != nil {
+		return RevokeSessionsForDeviceResponse{}, fmt.Errorf("device sessions revoked but audit emit failed: %w", err)
+	}
+
+	return RevokeSessionsForDeviceResponse{SessionsRevoked: int32(count)}, nil
 }
 
 // ListActiveSessions returns the caller's own currently-active sessions

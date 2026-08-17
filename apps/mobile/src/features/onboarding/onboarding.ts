@@ -291,20 +291,37 @@ export async function resumeSession(): Promise<{ identity: LocalIdentityRecord; 
 }
 
 // ---------------------------------------------------------------------------
-// removeDevice — Devices screen's default action. See
-// apps/mobile/src/capabilities/identity/index.ts's revokeDevice doc
-// comment for the full, unresolved device-removal/session-cascade gap this
-// deliberately does NOT attempt to paper over (docs/DECISION_LOG.md, this
-// pass's entry, and the Chief Architect's own routing note).
+// removeDevice — Devices screen's default action. Composed per charter §5's
+// ordering requirement (docs/DECISION_LOG.md, "Session/Request
+// Authentication contract amendment: RevokeSessionsForDevice", and the
+// charter's own §5 text): Identity's revokeDevice is called FIRST, so any
+// new IssueSession attempt for this device is blocked (DeviceResolver,
+// server-side) before sessionauth.revokeSessionsForDevice's revoke query
+// runs — closing the composed action's own network-round-trip gap, per
+// RevokeSessionsForDevice's atomicity requirement (charter §3) covering a
+// session issued in that gap. The composed action is not complete until
+// BOTH calls succeed — a revokeDevice success followed by a
+// revokeSessionsForDevice failure is surfaced as a thrown error, not
+// swallowed, so the caller (DevicesScreen) can tell the user the removal
+// was only partially applied rather than reporting false success.
 // ---------------------------------------------------------------------------
 export async function removeDevice(
   identityRef: string,
   deviceId: string,
   sessionToken: string,
-): Promise<{ epoch: number }> {
-  const resp = await identity.revokeDevice({ identityRef, deviceId }, sessionToken);
-  logAuditEvent("onboarding_device_removed", { identityRef, deviceId, epochAfter: String(resp.epoch) });
-  return resp;
+): Promise<{ epoch: number; sessionsRevoked: number }> {
+  const revokeDeviceResp = await identity.revokeDevice({ identityRef, deviceId }, sessionToken);
+  const revokeSessionsResp = await sessionauth.revokeSessionsForDevice({
+    callerSessionToken: sessionToken,
+    deviceId,
+  });
+  logAuditEvent("onboarding_device_removed", {
+    identityRef,
+    deviceId,
+    epochAfter: String(revokeDeviceResp.epoch),
+    sessionsRevoked: String(revokeSessionsResp.sessionsRevoked),
+  });
+  return { epoch: revokeDeviceResp.epoch, sessionsRevoked: revokeSessionsResp.sessionsRevoked };
 }
 
 // ---------------------------------------------------------------------------

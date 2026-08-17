@@ -69,6 +69,25 @@ export interface RevokeAllSessionsResponse {
   sessionsRevoked: number;
 }
 
+/**
+ * Mirrors sessionauth.RevokeSessionsForDeviceRequest/Response — added
+ * 2026-08-17 (charter amendment, guardian-gated, see
+ * docs/DECISION_LOG.md's "Session/Request Authentication contract
+ * amendment: RevokeSessionsForDevice") to close the device-removal
+ * session-cascade gap: revokes every active session for one device on the
+ * caller's own identity, never a bare identityRef/deviceId pair without a
+ * caller_session_token establishing which identity's devices may be
+ * touched.
+ */
+export interface RevokeSessionsForDeviceRequest {
+  callerSessionToken: string;
+  deviceId: string;
+}
+
+export interface RevokeSessionsForDeviceResponse {
+  sessionsRevoked: number;
+}
+
 export interface ListActiveSessionsResponse {
   sessions: SessionSummary[];
 }

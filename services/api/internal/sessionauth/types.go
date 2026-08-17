@@ -149,6 +149,25 @@ type RevokeAllSessionsResponse struct {
 	SessionsRevoked int32 `json:"sessionsRevoked"`
 }
 
+// RevokeSessionsForDeviceRequest/Response mirror the `RevokeSessionsForDevice`
+// RPC added to sessionauth.proto by the 2026-08-17 charter amendment (see
+// docs/capabilities/session-authentication.charter.md §3 and
+// docs/DECISION_LOG.md, "Session/Request Authentication contract amendment:
+// RevokeSessionsForDevice"). Same authorization shape as
+// RevokeAllSessionsRequest — CallerSessionToken, never a bare IdentityRef —
+// scoped additionally to one DeviceID. SessionsRevoked is a completion
+// guarantee, not a point-in-time snapshot count (charter's atomicity
+// requirement; see service.go's RevokeSessionsForDevice and store.go's
+// SessionStore.revokeAllForDevice).
+type RevokeSessionsForDeviceRequest struct {
+	CallerSessionToken string `json:"callerSessionToken"`
+	DeviceID           string `json:"deviceId"`
+}
+
+type RevokeSessionsForDeviceResponse struct {
+	SessionsRevoked int32 `json:"sessionsRevoked"`
+}
+
 type ListActiveSessionsRequest struct {
 	CallerSessionToken string `json:"callerSessionToken"`
 }

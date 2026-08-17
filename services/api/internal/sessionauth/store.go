@@ -46,10 +46,25 @@ type NonceStore interface {
 }
 
 // SessionStore is the persistence boundary Service depends on for issued
-// sessions. Its seven unexported methods match InMemorySessionStore's own
+// sessions. Its unexported methods match InMemorySessionStore's own
 // pre-existing method set exactly (kept unexported — only types in this
 // package can implement it: InMemorySessionStore here and
 // PostgresSessionStore in postgres_session_store.go).
+//
+// currentDeviceGeneration/putIfDeviceGenerationUnchanged/revokeAllForDevice
+// (added 2026-08-17, RevokeSessionsForDevice amendment) are the atomicity
+// primitive charter §3's amendment requires: "a per-device serialization
+// point... or a revoked-at watermark for the device that IssueSession
+// checks as part of its own commit." See revokeAllForDevice's doc comment
+// below for the full design — a monotonically increasing per-(identity_ref,
+// device_id) generation counter, mirroring Identity's own `epoch` counter
+// (services/api/internal/identity/sign.go), checked-and-incremented
+// atomically by revokeAllForDevice and checked-and-compared atomically by
+// putIfDeviceGenerationUnchanged, with the two operations mutually
+// exclusive against each other per device (InMemorySessionStore: the same
+// single mutex every other method already uses; PostgresSessionStore: a
+// transaction holding a `SELECT ... FOR UPDATE` row lock on the device's
+// generation row — see that file).
 type SessionStore interface {
 	put(sess Session)
 	get(token string) (Session, bool)
@@ -58,6 +73,51 @@ type SessionStore interface {
 	deleteAllForIdentity(identityRef string) int
 	listActiveForIdentity(identityRef string, nowUnix int64) []Session
 	listAllForIdentity(identityRef string) []Session
+
+	// currentDeviceGeneration reads the current generation for
+	// (identityRef, deviceID) WITHOUT taking the per-device serialization
+	// lock or mutating anything — a plain, non-atomic read. Used by
+	// IssueSession (service.go) to capture "my view of the world" shortly
+	// before attempting to commit; the actual correctness guarantee comes
+	// from putIfDeviceGenerationUnchanged's atomic re-check at commit time,
+	// not from this read being fresh. A device with no revocation history
+	// yet has generation 0 (the Go zero value / SQL DEFAULT 0 — see
+	// 0007_sessionauth_device_generations.up.sql), never an error.
+	currentDeviceGeneration(identityRef, deviceID string) int64
+
+	// putIfDeviceGenerationUnchanged is IssueSession's atomic commit gate
+	// (the "revoked-at watermark... checked as part of its own commit"
+	// half of the charter's two named options): atomically re-reads the
+	// current generation for (sess.IdentityRef, sess.DeviceID) and, ONLY IF
+	// it still equals expectedGeneration, inserts sess and returns true.
+	// Returns false, WITHOUT inserting, if the generation has moved on —
+	// meaning a RevokeSessionsForDevice call for this device committed
+	// (and already returned success to its own caller) at some point
+	// between when this caller captured expectedGeneration and this call.
+	// This is what makes revokeAllForDevice's "sessions_revoked is a
+	// completion guarantee, not a point-in-time snapshot" claim true even
+	// when a concurrently in-flight IssueSession call reaches this final
+	// commit step AFTER a RevokeSessionsForDevice call for the same device
+	// has already fully committed and returned.
+	putIfDeviceGenerationUnchanged(sess Session, expectedGeneration int64) bool
+
+	// revokeAllForDevice atomically (a) increments the generation for
+	// (identityRef, deviceID) and (b) deletes every session currently
+	// stored for that exact (identityRef, deviceID) pair, as ONE
+	// serialized unit against any concurrent putIfDeviceGenerationUnchanged
+	// call for the same device — see that method's doc comment and
+	// PostgresSessionStore's implementation for why serialization (not
+	// just "eventually consistent" ordering) is required. Returns the
+	// number of sessions deleted. Backs RevokeSessionsForDevice
+	// (service.go): whichever of the two operations' critical sections
+	// runs first for a given device, the other is guaranteed to observe
+	// its effect — either the new session is caught by THIS delete (it
+	// existed by the time revokeAllForDevice's critical section ran), or
+	// putIfDeviceGenerationUnchanged's own generation check rejects the
+	// insert (this call already bumped the generation before that check
+	// ran) — so no session for the device can survive a revokeAllForDevice
+	// call that has already returned, regardless of interleaving.
+	revokeAllForDevice(identityRef, deviceID string) int
 }
 
 // --- nonce store ---
@@ -151,14 +211,37 @@ func (s *InMemoryNonceStore) consumeIfValid(nonce, identityRef, deviceID string,
 // --- session store ---
 
 // InMemorySessionStore is a goroutine-safe, process-local store for issued
-// sessions, keyed by session_token.
+// sessions, keyed by session_token, plus (added 2026-08-17,
+// RevokeSessionsForDevice amendment) a per-(identity_ref, device_id)
+// generation counter backing the atomicity guarantee described on
+// SessionStore's currentDeviceGeneration/putIfDeviceGenerationUnchanged/
+// revokeAllForDevice doc comments above. Deliberately guarded by the SAME
+// mutex (s.mu) as sessions itself, not a second lock — that single mutex
+// is exactly the "per-device serialization point" (in this in-memory
+// implementation, serialization is coarser than per-device — the whole
+// store serializes on one mutex, same as every other InMemorySessionStore
+// method already does — but that is still strictly sufficient: mutual
+// exclusion across ALL devices trivially implies mutual exclusion for any
+// ONE device).
 type InMemorySessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]Session
+	mu                sync.Mutex
+	sessions          map[string]Session
+	deviceGenerations map[string]int64
 }
 
 func NewInMemorySessionStore() *InMemorySessionStore {
-	return &InMemorySessionStore{sessions: make(map[string]Session)}
+	return &InMemorySessionStore{
+		sessions:          make(map[string]Session),
+		deviceGenerations: make(map[string]int64),
+	}
+}
+
+// deviceGenerationKey mirrors fakeDeviceResolver's own identityRef+"|"+deviceID
+// test-double convention (service_test.go) — a plain delimited string is
+// sufficient here since this is purely an in-process map key, never
+// serialized or compared across a process boundary.
+func deviceGenerationKey(identityRef, deviceID string) string {
+	return identityRef + "\x00" + deviceID
 }
 
 func (s *InMemorySessionStore) put(sess Session) {
@@ -247,4 +330,51 @@ func (s *InMemorySessionStore) listAllForIdentity(identityRef string) []Session 
 		}
 	}
 	return out
+}
+
+// currentDeviceGeneration returns the current generation for (identityRef,
+// deviceID), 0 if none has ever been recorded (a device that has never had
+// RevokeSessionsForDevice called for it). See SessionStore's doc comment
+// for the full atomicity design this is one third of.
+func (s *InMemorySessionStore) currentDeviceGeneration(identityRef, deviceID string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deviceGenerations[deviceGenerationKey(identityRef, deviceID)]
+}
+
+// putIfDeviceGenerationUnchanged is IssueSession's atomic commit gate — see
+// SessionStore's doc comment. Holding s.mu across both the generation
+// comparison and the session insert is what makes this atomic with respect
+// to a concurrent revokeAllForDevice call (below), which holds the exact
+// same mutex across its own generation-bump-and-delete.
+func (s *InMemorySessionStore) putIfDeviceGenerationUnchanged(sess Session, expectedGeneration int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.deviceGenerations[deviceGenerationKey(sess.IdentityRef, sess.DeviceID)]
+	if current != expectedGeneration {
+		return false
+	}
+	s.sessions[sess.SessionToken] = sess
+	return true
+}
+
+// revokeAllForDevice atomically bumps (identityRef, deviceID)'s generation
+// and deletes every session currently stored for that exact pair — see
+// SessionStore's doc comment for why this must be one atomic unit (not two
+// separate operations) and why it correctly closes the race against a
+// concurrent putIfDeviceGenerationUnchanged call for the same device.
+func (s *InMemorySessionStore) revokeAllForDevice(identityRef, deviceID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := deviceGenerationKey(identityRef, deviceID)
+	s.deviceGenerations[key] = s.deviceGenerations[key] + 1
+
+	count := 0
+	for token, sess := range s.sessions {
+		if sess.IdentityRef == identityRef && sess.DeviceID == deviceID {
+			delete(s.sessions, token)
+			count++
+		}
+	}
+	return count
 }

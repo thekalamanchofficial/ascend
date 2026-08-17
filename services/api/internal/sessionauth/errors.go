@@ -23,5 +23,17 @@ var (
 	ErrSessionNotFound        = errors.New("sessionauth: session not found")
 	ErrSessionInvalid         = errors.New("sessionauth: session_token is unknown, expired, or revoked")
 
+	// ErrDeviceSessionsRevokedConcurrently is IssueSession's rejection when
+	// its atomic commit gate (store.go's putIfDeviceGenerationUnchanged)
+	// finds the device's generation has moved on since this request
+	// captured it — meaning a RevokeSessionsForDevice call for this exact
+	// device committed (and already returned success to its own caller)
+	// during this request's lifetime. This is the charter's atomicity
+	// requirement (§3, RevokeSessionsForDevice amendment) actually firing,
+	// not a bug: the correct, intended outcome is that this in-flight
+	// IssueSession attempt loses, so no session for a just-revoked device
+	// can survive a RevokeSessionsForDevice call that already returned.
+	ErrDeviceSessionsRevokedConcurrently = errors.New("sessionauth: this device's sessions were revoked while this request was in flight")
+
 	errAuditNotConfigured = errors.New("sessionauth: no AuditEmitter configured")
 )

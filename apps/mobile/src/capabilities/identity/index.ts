@@ -179,21 +179,19 @@ export async function bindDevice(request: BindDeviceRequest): Promise<BindDevice
  * requireCallerMatchesIdentity middleware). Pass the current session's
  * token, obtained from Session/Request Authentication's issueSession.
  *
- * KNOWN GAP (do not silently paper over — see
+ * This revokes only the Identity binding — it does NOT by itself revoke
+ * the device's active sessions. That used to be a real, unclosed gap (see
  * docs/DECISION_LOG.md, 2026-08-17, "UI integration readiness verification"
- * and this pass's own entry): removing a device here revokes its Identity
- * binding ONLY. It does NOT also revoke that device's currently-active
- * sessions. Session/Request Authentication's ListActiveSessions returns no
- * session_token per session (by design — see sessionauth's charter §3), so
- * this client has no way to look up and RevokeSession the specific
- * sessions belonging to `request.deviceId`. RevokeAllSessions is scoped to
- * ALL of the *caller's own* sessions across every device, not one target
- * device, so calling it here would be over-broad and silently change the
- * promised "remove this device" UX without authorization. ValidateSession
- * also does not re-check device-bound status, so a removed device's
- * already-issued sessions remain valid until natural expiry. This is a
- * cross-capability contract gap, routed back to the Chief Architect, not
- * resolved unilaterally here.
+ * and "Identity + Session/Request Authentication mobile client
+ * integration"), closed the same day via a charter amendment adding
+ * sessionauth's `revokeSessionsForDevice` RPC. Callers of this function
+ * MUST also call `sessionauth.revokeSessionsForDevice`, in that order (this
+ * call first), to complete a real device removal — see
+ * `onboarding.ts`'s `removeDevice`, the one real call site, which does
+ * exactly that per the charter's §5 composition-ordering requirement. This
+ * function on its own remains a legitimate, narrower operation (unbind a
+ * device without necessarily touching its live sessions) for any future
+ * caller that genuinely wants only that.
  */
 // ascend:mutates
 export async function revokeDevice(request: RevokeDeviceRequest, sessionToken: string): Promise<RevokeDeviceResponse> {

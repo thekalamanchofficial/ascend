@@ -23,13 +23,14 @@ import (
 //
 // Routes:
 //
-//	POST /v1/sessionauth/challenge         GetSessionChallenge
-//	POST /v1/sessionauth/sessions          IssueSession
-//	POST /v1/sessionauth/sessions/validate ValidateSession
-//	POST /v1/sessionauth/sessions/revoke     RevokeSession
-//	POST /v1/sessionauth/sessions/revoke-all RevokeAllSessions
-//	GET  /v1/sessionauth/sessions/active     ListActiveSessions
-//	GET  /v1/sessionauth/sessions/export     ExportSessions
+//	POST /v1/sessionauth/challenge            GetSessionChallenge
+//	POST /v1/sessionauth/sessions             IssueSession
+//	POST /v1/sessionauth/sessions/validate    ValidateSession
+//	POST /v1/sessionauth/sessions/revoke      RevokeSession
+//	POST /v1/sessionauth/sessions/revoke-all  RevokeAllSessions
+//	POST /v1/sessionauth/sessions/revoke-device RevokeSessionsForDevice (added 2026-08-17 amendment)
+//	GET  /v1/sessionauth/sessions/active      ListActiveSessions
+//	GET  /v1/sessionauth/sessions/export      ExportSessions
 func Mount(r chi.Router, svc *Service) {
 	r.Route("/v1/sessionauth", func(r chi.Router) {
 		r.Post("/challenge", handleGetSessionChallenge(svc))
@@ -37,6 +38,7 @@ func Mount(r chi.Router, svc *Service) {
 		r.Post("/sessions/validate", handleValidateSession(svc))
 		r.Post("/sessions/revoke", handleRevokeSession(svc))
 		r.Post("/sessions/revoke-all", handleRevokeAllSessions(svc))
+		r.Post("/sessions/revoke-device", handleRevokeSessionsForDevice(svc))
 		r.Get("/sessions/active", handleListActiveSessions(svc))
 		r.Get("/sessions/export", handleExportSessions(svc))
 	})
@@ -97,6 +99,17 @@ func handleRevokeAllSessions(svc *Service) http.HandlerFunc {
 			return
 		}
 		resp, err := svc.RevokeAllSessions(req)
+		writeResult(w, http.StatusOK, resp, err)
+	}
+}
+
+func handleRevokeSessionsForDevice(svc *Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req RevokeSessionsForDeviceRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		resp, err := svc.RevokeSessionsForDevice(req)
 		writeResult(w, http.StatusOK, resp, err)
 	}
 }
@@ -171,7 +184,8 @@ func statusForError(err error) int {
 	switch {
 	case errors.Is(err, ErrInvalidArgument):
 		return http.StatusBadRequest
-	case errors.Is(err, ErrInvalidNonce), errors.Is(err, ErrInvalidSignature), errors.Is(err, ErrDeviceNotBound):
+	case errors.Is(err, ErrInvalidNonce), errors.Is(err, ErrInvalidSignature), errors.Is(err, ErrDeviceNotBound),
+		errors.Is(err, ErrDeviceSessionsRevokedConcurrently):
 		return http.StatusUnauthorized
 	case errors.Is(err, ErrSessionNotFound):
 		return http.StatusNotFound

@@ -24,6 +24,8 @@ import type {
   RevokeSessionResponse,
   RevokeAllSessionsRequest,
   RevokeAllSessionsResponse,
+  RevokeSessionsForDeviceRequest,
+  RevokeSessionsForDeviceResponse,
   ListActiveSessionsResponse,
   ExportSessionsResponse,
 } from "./types";
@@ -164,10 +166,34 @@ export async function revokeAllSessions(request: RevokeAllSessionsRequest): Prom
 }
 
 // ---------------------------------------------------------------------------
+// RevokeSessionsForDevice — added 2026-08-17 (charter amendment) to close
+// the device-removal session-cascade gap: revokes every active session for
+// one device on the caller's own identity. Composition ordering requirement
+// (charter §5): callers MUST call Identity's revokeDevice FIRST, then this —
+// see onboarding.ts's removeDevice, the one real call site.
+// ---------------------------------------------------------------------------
+
+// ascend:mutates
+export async function revokeSessionsForDevice(
+  request: RevokeSessionsForDeviceRequest,
+): Promise<RevokeSessionsForDeviceResponse> {
+  const resp = await apiRequest<RevokeSessionsForDeviceResponse>("/v1/sessionauth/sessions/revoke-device", {
+    method: "POST",
+    bearerToken: null,
+    body: { callerSessionToken: request.callerSessionToken, deviceId: request.deviceId },
+  });
+
+  logAuditEvent("device_sessions_revoked", {
+    deviceId: request.deviceId,
+    sessionsRevoked: String(resp.sessionsRevoked),
+  });
+
+  return resp;
+}
+
+// ---------------------------------------------------------------------------
 // ListActiveSessions — gated, read-only, no request body (bearer token
-// only). Deliberately returns no session_token per session (charter §3) —
-// this is what makes RevokeDevice's session cascade impossible client-side;
-// see identity/index.ts's revokeDevice doc comment for the full gap.
+// only). Deliberately returns no session_token per session (charter §3).
 // ---------------------------------------------------------------------------
 
 export async function listActiveSessions(callerSessionToken: string): Promise<ListActiveSessionsResponse> {
