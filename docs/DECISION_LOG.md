@@ -1966,7 +1966,7 @@ Added `ListFileObjects(owner, requesting_subject) -> [file_object]` to `docs/cap
 
 **Made by:** Chief Architect (charter amendment), Founder (the decision to amend rather than ship a client-side workaround).
 
-**Guardian gate:** pending — see charter §8 for the amendment-specific table.
+**Guardian gate:** Constitution Warden initially **blocked**: the amendment's claim that `ListFileObjects` needed no audit path ("same as `ListVersions`/`GetFileMetadata`/etc.") didn't survive tracing — those four reads' denials ARE audited, via `fileobjects.read`'s shared `CheckPermission` call site (§4's load-bearing mechanism); `ListFileObjects` bypasses `CheckPermission` entirely by design, so it inherits no such path, and a rejected call here (attempting to enumerate a stranger's entire file inventory) is arguably more audit-worthy than a single denied read, not exempt. Authorization design, self-only/`ExportAllBlobs` parity, and the `blob_ref`-leak-path claims were all independently verified sound (including against the real `FileObject` Go struct). Resolved by requiring `ListFileObjects` to emit its own dedicated audit event on every `requesting_subject != owner` rejection (§3, §4 both updated) — unblocked. Non-blocking aside raised and tracked separately (`docs/CAPABILITY_REGISTRY.md`): `Storage.ExportAllBlobs` may have this identical latent gap in its own charter, not investigated as part of this pass. Security Steward review still pending.
 
 ---
 
