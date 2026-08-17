@@ -1940,3 +1940,17 @@ This was masking, not causing, the actual crash under investigation — with Log
 
 ---
 
+### 2026-08-18 — Android emulator end-to-end confirmed working; two environment findings along the way
+
+**Decision/finding:** With the entry-point and `metro.config.js` fixes above in place, live-verified the full mobile app actually running on a real Android emulator (screenshots + `adb logcat`, not just a bundler-level check): Expo Go loads the project, the Create Identity screen renders exactly per charter §5's design, and Cryptography & Keys' on-device key generation genuinely executes (`identity_key_generated`/`key_pair_generated` audit events fired for real, correct `purpose: "sign:device-binding"`/`keyType: "ed25519"`).
+
+Two unrelated environment issues surfaced and were resolved along the way, neither a defect in this repo's code:
+1. **A stray, year-old, unrelated standalone app** (`com.anonymous.mobile`, installed 2025-07-04 on this specific emulator, clearly from unrelated prior tinkering on this machine) was also registered as an `exp://` link handler, causing Android's intent resolver to route Expo Go's own connection links to it instead — presenting as an unrelated blank screen and masking the real app entirely. Uninstalling it resolved the ambiguity. Also observed a genuine `ClassCastException` crash inside Expo Go's own bundled (project-unused) Reanimated module when this ambiguity was present; it did not recur once the stray app was removed — plausibly related resource/task contention, not conclusively root-caused, but not reproducible after cleanup either.
+2. **`EXPO_PUBLIC_API_URL` set via PowerShell's `$env:` doesn't survive a session/terminal change**, and `expo start`'s dev server was restarted several times across this debugging session (to pick up the entry-point/metro-config fixes) — the variable silently reverted to its default (`http://localhost:8080`, meaningless from inside an emulator, which has its own separate loopback). Fixed durably: `apps/mobile/.env` (gitignored, machine-local) with `EXPO_PUBLIC_API_URL=http://10.0.2.2:8080` (the Android emulator's fixed host-loopback alias) — Expo CLI loads `.env` automatically on every start, removing the "remember to re-set the shell var" failure mode entirely. Added `apps/mobile/.env.example` (committed) documenting the three real cases (Android emulator / physical device / web) so this isn't rediscovered painfully again. Verified live: the compiled bundle's baked-in constant changed from `localhost:8080` to `10.0.2.2:8080` after adding the file, confirmed via a throwaway `expo start` instance before asking the founder to retest.
+
+**Article(s) invoked:** Art. 12 (a config value that silently reverts across routine restarts is not simple by default — durable file-based config beats "remember to set this in your shell every time").
+
+**Made by:** Chief Architect.
+
+---
+
