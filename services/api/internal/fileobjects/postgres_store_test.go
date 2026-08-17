@@ -285,3 +285,54 @@ func TestPostgresStore_DeleteFileObjectRecordIsAtomicAcrossAllThreeTables(t *tes
 		}
 	}
 }
+
+// TestPostgresStore_ListFileObjectsByOwner covers listFileObjectsByOwner
+// (charter §3's ListFileObjects RPC, added 2026-08-18): an owner's own
+// records come back, another owner's records (created in the same run, to
+// prove the WHERE clause actually filters rather than happening to return
+// everything) do not, and tombstoned records ARE still returned by the
+// store method itself (Service.ListFileObjects is what filters them out —
+// see service.go's doc comment).
+func TestPostgresStore_ListFileObjectsByOwner(t *testing.T) {
+	store := newTestPostgresStore(t)
+	run := uniqueRunID(t)
+	ownerA := "identity:owner-a-" + run
+	ownerB := "identity:owner-b-" + run
+	idLive := "fo-live-" + run
+	idTombstoned := "fo-tombstoned-" + run
+	idOther := "fo-other-owner-" + run
+	t.Cleanup(func() {
+		cleanupFileObject(t, store, idLive)
+		cleanupFileObject(t, store, idTombstoned)
+		cleanupFileObject(t, store, idOther)
+	})
+
+	store.putFileObject(FileObjectRecord{FileObjectID: idLive, Owner: ownerA, CurrentVersionRef: "v1", Name: "a.pdf", MimeType: "application/pdf", SizeBytes: 1, CreatedAtUnix: 100})
+	store.putFileObject(FileObjectRecord{FileObjectID: idTombstoned, Owner: ownerA, CurrentVersionRef: "v1", Name: "b.pdf", MimeType: "application/pdf", SizeBytes: 2, CreatedAtUnix: 200, Deleted: true, DeletedAtUnix: 300})
+	store.putFileObject(FileObjectRecord{FileObjectID: idOther, Owner: ownerB, CurrentVersionRef: "v1", Name: "c.pdf", MimeType: "application/pdf", SizeBytes: 3, CreatedAtUnix: 400})
+
+	gotA := store.listFileObjectsByOwner(ownerA)
+	if len(gotA) != 2 {
+		t.Fatalf("expected 2 records for owner A (one live, one tombstoned), got %d: %+v", len(gotA), gotA)
+	}
+	seen := map[string]bool{}
+	for _, r := range gotA {
+		if r.Owner != ownerA {
+			t.Fatalf("listFileObjectsByOwner(%q) returned a record owned by %q", ownerA, r.Owner)
+		}
+		seen[r.FileObjectID] = true
+	}
+	if !seen[idLive] || !seen[idTombstoned] {
+		t.Fatalf("expected both idLive and idTombstoned in owner A's results, got %+v", gotA)
+	}
+
+	gotB := store.listFileObjectsByOwner(ownerB)
+	if len(gotB) != 1 || gotB[0].FileObjectID != idOther {
+		t.Fatalf("expected exactly owner B's own single record, got %+v", gotB)
+	}
+
+	gotNobody := store.listFileObjectsByOwner("identity:nobody-" + run)
+	if len(gotNobody) != 0 {
+		t.Fatalf("expected no records for an owner with none, got %+v", gotNobody)
+	}
+}

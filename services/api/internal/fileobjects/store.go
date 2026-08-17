@@ -24,6 +24,14 @@ type Store interface {
 	getVersion(fileObjectID, versionRef string) (VersionRecord, bool)
 	addEvent(fileObjectID string, e FileEvent)
 	eventsForFileObject(fileObjectID string) []FileEvent
+	// listFileObjectsByOwner returns every FileObjectRecord (including
+	// tombstones — mirroring Storage's own recordsForOwner precedent
+	// exactly, internal/storage/store.go) owned by owner, backing
+	// ListFileObjects (charter §3, added 2026-08-18). Service.ListFileObjects
+	// filters out tombstones before returning — see its own doc comment for
+	// why a "my files" inventory deliberately excludes them while the store
+	// method itself stays as unopinionated as every other list method here.
+	listFileObjectsByOwner(owner string) []FileObjectRecord
 }
 
 // InMemoryStore is the first-pass Store implementation: a mutex-guarded,
@@ -119,5 +127,20 @@ func (s *InMemoryStore) eventsForFileObject(fileObjectID string) []FileEvent {
 	src := s.events[fileObjectID]
 	out := make([]FileEvent, len(src))
 	copy(out, src)
+	return out
+}
+
+// listFileObjectsByOwner returns every FileObjectRecord (including
+// tombstones) owned by owner, backing ListFileObjects (charter §3). No
+// ordering guarantee, matching Storage's recordsForOwner precedent exactly.
+func (s *InMemoryStore) listFileObjectsByOwner(owner string) []FileObjectRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []FileObjectRecord
+	for _, r := range s.fileObjects {
+		if r.Owner == owner {
+			out = append(out, r)
+		}
+	}
 	return out
 }

@@ -3,6 +3,7 @@ package fileobjects
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -761,5 +762,152 @@ func TestDeleteFileObject_DeniedWithoutWriteGrant(t *testing.T) {
 	_, err := svc.DeleteFileObject(DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: stranger})
 	if !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("expected ErrPermissionDenied, got %v", err)
+	}
+}
+
+// --- ListFileObjects (charter §3, added 2026-08-18) -------------------
+
+// TestListFileObjects_HappyPath_OwnerGetsExactlyTheirOwnFileObjects proves
+// an owner with several file objects gets exactly those back, and that
+// another identity's file objects are absent — the core "my files" use case
+// this RPC exists for.
+func TestListFileObjects_HappyPath_OwnerGetsExactlyTheirOwnFileObjects(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+
+	fo1 := createTestFileObject(t, svc, owner, []byte("one"))
+	fo2 := createTestFileObject(t, svc, owner, []byte("two"))
+	fo3 := createTestFileObject(t, svc, owner, []byte("three"))
+	// Another identity's own file object must never appear in owner's list.
+	_ = createTestFileObject(t, svc, stranger, []byte("not-mine"))
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 3 {
+		t.Fatalf("expected exactly 3 file objects for owner, got %d: %+v", len(resp.FileObjects), resp.FileObjects)
+	}
+	got := map[string]bool{}
+	for _, fo := range resp.FileObjects {
+		if fo.Owner != owner {
+			t.Fatalf("ListFileObjects(owner=%q) returned a file object owned by %q", owner, fo.Owner)
+		}
+		got[fo.FileObjectID] = true
+	}
+	for _, want := range []string{fo1.FileObjectID, fo2.FileObjectID, fo3.FileObjectID} {
+		if !got[want] {
+			t.Fatalf("expected file_object_id %q in owner's list, got %+v", want, resp.FileObjects)
+		}
+	}
+
+	// stranger's own list must not include any of owner's file objects.
+	strangerResp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: stranger, RequestingSubject: stranger})
+	if err != nil {
+		t.Fatalf("ListFileObjects (stranger): %v", err)
+	}
+	if len(strangerResp.FileObjects) != 1 {
+		t.Fatalf("expected exactly 1 file object for stranger, got %d: %+v", len(strangerResp.FileObjects), strangerResp.FileObjects)
+	}
+}
+
+// TestListFileObjects_ExcludesTombstonedFileObjects documents and proves
+// this implementation's choice (service.go's doc comment): a deleted file
+// object's content is gone, so ListFileObjects excludes it from the "my
+// files" inventory even though the record itself is retained as a
+// tombstone.
+func TestListFileObjects_ExcludesTombstonedFileObjects(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	if _, err := svc.DeleteFileObject(DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}); err != nil {
+		t.Fatalf("DeleteFileObject: %v", err)
+	}
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 0 {
+		t.Fatalf("expected the tombstoned file object to be excluded, got %+v", resp.FileObjects)
+	}
+}
+
+// TestListFileObjects_ServiceLevelMismatchRejectedAndAudited is the
+// service-level half of charter §3's required two-layer authorization
+// discipline: requesting_subject != owner must be rejected, and the
+// rejection must be audited (action file.list_denied, actor the caller who
+// attempted the mismatched call, resource ("identity", owner) — never a
+// file_object_id).
+func TestListFileObjects_ServiceLevelMismatchRejectedAndAudited(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: stranger})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied for requesting_subject != owner, got %v", err)
+	}
+	if len(resp.FileObjects) != 0 {
+		t.Fatalf("expected no file objects returned on rejection, got %+v", resp.FileObjects)
+	}
+
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the service-level rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != listDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", listDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the caller who attempted the mismatched call (%q), got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("expected audit resource (\"identity\", %q) naming the targeted owner, got %+v", owner, call.resource)
+	}
+}
+
+// TestListFileObjects_EmptyFieldsRejected covers the ordinary required-field
+// validation, matching this package's other RPCs' precedent.
+func TestListFileObjects_EmptyFieldsRejected(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	if _, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: "", RequestingSubject: owner}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty owner, got %v", err)
+	}
+	if _, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: ""}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty requesting_subject, got %v", err)
+	}
+}
+
+// TestListFileObjects_ResponseNeverContainsBlobRef is charter §3's own
+// established paranoia about this specific leak (§6 point 8), applied to
+// this new RPC — trivial since FileObject (types.go) structurally has no
+// BlobRef field at all, but asserted explicitly rather than only relying on
+// "it compiles", matching blob_ref_leak_test.go's own precedent.
+func TestListFileObjects_ResponseNeverContainsBlobRef(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	versions := storeVersionsFor(t, svc, fo.FileObjectID)
+	if len(versions) != 1 || versions[0].BlobRef == "" {
+		t.Fatalf("setup failed: expected exactly one version with a blob_ref, got %+v", versions)
+	}
+	blobRef := versions[0].BlobRef
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 1 {
+		t.Fatalf("expected exactly 1 file object, got %d", len(resp.FileObjects))
+	}
+	// FileObject (types.go) has no BlobRef field — reflect over it to prove
+	// that structurally, not just by inspecting the fields this test happens
+	// to know about.
+	rv := reflect.ValueOf(resp.FileObjects[0])
+	for i := 0; i < rv.NumField(); i++ {
+		fieldName := rv.Type().Field(i).Name
+		if strings.EqualFold(fieldName, "BlobRef") {
+			t.Fatalf("FileObject must never have a BlobRef field, found %q", fieldName)
+		}
+		if s, ok := rv.Field(i).Interface().(string); ok && s == blobRef {
+			t.Fatalf("field %q unexpectedly equals a real blob_ref (%q) — leak", fieldName, blobRef)
+		}
 	}
 }

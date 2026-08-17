@@ -108,6 +108,71 @@ func (s *Service) checkRead(subject, fileObjectID, rpcName string) error {
 	return nil
 }
 
+// listDeniedAction is the audit action emitted on every ListFileObjects
+// rejection — service-level (requesting_subject != owner) or HTTP-level
+// (requesting_subject != verified caller, http.go) — per charter §3/§4's
+// broadened denial-auditing requirement (docs/DECISION_LOG.md, 2026-08-18,
+// "ListFileObjects: Security Steward veto and fix"). Named "file.list_..."
+// rather than "fileobjects...." to match the charter bullet's own literal
+// example action name.
+const listDeniedAction = "file.list_denied"
+
+// auditListDenied is ListFileObjects' single shared denial-audit call
+// site — deliberately callable from both this file (the service-level
+// requesting_subject/owner mismatch) and http.go (the HTTP-level
+// caller/requesting_subject mismatch), same package, so both rejection
+// reasons funnel through identical audit vocabulary (mirrors checkRead's
+// "one shared call site" discipline above). resource is always
+// ("identity", owner) — naming whose inventory was targeted, never a
+// file_object_id (charter §3: this is an account-level enumeration
+// attempt, not a single-file access attempt).
+func (s *Service) auditListDenied(actor, owner string) {
+	_, _ = s.audit.Emit(actor, listDeniedAction,
+		ResourceRef{ResourceType: "identity", ResourceID: owner},
+		"requesting_subject_mismatch", nil)
+}
+
+// ListFileObjects returns every FileObject owner has ever created —
+// deliberately NOT CheckPermission-gated (charter §3, mirroring Storage's
+// ExportAllBlobs precedent exactly): this is a self-only,
+// right-to-see-your-own-stuff inventory listing, not a shareable read.
+// Tombstoned (deleted) file objects are excluded — a "my files" listing
+// should show what a caller actually still has, not entries whose content
+// has already been irreversibly destroyed; GetFileHistory remains reachable
+// for a deleted file object if its file_object_id is already known by other
+// means (charter §3's own precedent for what stays resolvable post-delete).
+//
+// AUTHORIZATION (charter §3, corrected 2026-08-18 after Security Steward's
+// veto of the original draft — see docs/DECISION_LOG.md): this
+// requesting_subject == owner check is only ONE of two independent checks
+// required to actually close the authorization bypass caught at charter
+// stage. The second, EQUALLY REQUIRED check — requesting_subject == the
+// verified network caller — lives in http.go's handler and runs BEFORE this
+// method is ever called. Neither check alone is sufficient: this check
+// alone (as the charter's first draft specified) trusts both Owner and
+// RequestingSubject as self-asserted request fields, binding neither to who
+// is actually, verifiably making the call — a caller could send
+// owner=requesting_subject=<victim> and this check alone would pass.
+func (s *Service) ListFileObjects(req ListFileObjectsRequest) (ListFileObjectsResponse, error) {
+	if req.Owner == "" || req.RequestingSubject == "" {
+		return ListFileObjectsResponse{}, fmt.Errorf("%w: owner and requesting_subject are required", ErrInvalidArgument)
+	}
+	if req.RequestingSubject != req.Owner {
+		s.auditListDenied(req.RequestingSubject, req.Owner)
+		return ListFileObjectsResponse{}, ErrPermissionDenied
+	}
+
+	records := s.store.listFileObjectsByOwner(req.Owner)
+	out := make([]FileObject, 0, len(records))
+	for _, r := range records {
+		if r.Deleted {
+			continue
+		}
+		out = append(out, r.toFileObject())
+	}
+	return ListFileObjectsResponse{FileObjects: out}, nil
+}
+
 // CreateFileObject allocates identity, stores version 1's content, and
 // bootstraps both Permissions resource namespaces this capability owns
 // (charter §6 point 2): the owner's first grant on

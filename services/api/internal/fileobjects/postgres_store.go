@@ -293,6 +293,38 @@ func (s *PostgresStore) eventsForFileObject(fileObjectID string) []FileEvent {
 	return out
 }
 
+// listFileObjectsByOwner returns every FileObjectRecord (including
+// tombstones) owned by owner, backing ListFileObjects (charter §3, added
+// 2026-08-18). Queries fileobjects_records.owner, indexed by
+// 0008_fileobjects_owner_index.up.sql. See PostgresStore's doc comment for
+// why a genuine query failure folds into an empty slice, matching
+// listVersions/eventsForFileObject's existing precedent exactly.
+func (s *PostgresStore) listFileObjectsByOwner(owner string) []FileObjectRecord {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx, `
+		SELECT file_object_id, owner, current_version_ref, name, mime_type, tags, size_bytes, created_at_unix, deleted, deleted_at_unix, last_history_event_id
+		FROM fileobjects_records
+		WHERE owner = $1
+	`, owner)
+	if err != nil {
+		return []FileObjectRecord{}
+	}
+	defer rows.Close()
+
+	out := make([]FileObjectRecord, 0)
+	for rows.Next() {
+		r, err := scanFileObjectRecord(rows)
+		if err != nil {
+			return []FileObjectRecord{}
+		}
+		out = append(out, r)
+	}
+	if rows.Err() != nil {
+		return []FileObjectRecord{}
+	}
+	return out
+}
+
 // rowScanner is the common subset of pgx.Row and pgx.Rows this package
 // needs (just Scan), matching Audit's/Permissions' own equivalent seam
 // (internal/audit/postgres_store.go, internal/permissions/postgres_store.go).

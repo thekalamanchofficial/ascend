@@ -435,8 +435,124 @@ func TestHTTP_DeleteFileObject_CallerMatchSucceeds(t *testing.T) {
 	}
 }
 
+// --- ListFileObjects ---
+
+// TestHTTP_ListFileObjects_CallerMismatchRejectedDespiteServiceFieldsMatching
+// is the real, load-bearing proof of the Security Steward veto fix
+// (docs/DECISION_LOG.md, 2026-08-18, "ListFileObjects: Security Steward
+// veto and fix"): a request whose Owner and RequestingSubject fields agree
+// with EACH OTHER (which is all the original, vetoed charter draft would
+// have checked) must still be rejected when the verified network caller is
+// someone else entirely — proving the HTTP-level check is real and not
+// redundant with the service-level one. Uses the real httptest handler, not
+// the service layer in isolation, matching this file's own precedent for
+// its other ten routes.
+func TestHTTP_ListFileObjects_CallerMismatchRejectedDespiteServiceFieldsMatching(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// Verified caller is mallory (stranger), but the request body claims
+	// owner=requesting_subject=alice (owner) — internally self-consistent,
+	// exactly what the original vetoed draft would have let through.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", stranger, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for caller/requesting_subject mismatch even though owner==requesting_subject, got %d", resp.StatusCode)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+
+	// This rejection must be audited too (charter §3's denial-auditing
+	// requirement, broadened to cover the HTTP-level check as well as the
+	// service-level one) — actor is the VERIFIED caller (mallory), never the
+	// unverified request body's requesting_subject (alice), resource is
+	// ("identity", owner), never a file_object_id.
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the HTTP-level rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != listDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", listDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the verified caller (%q), got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("expected audit resource (\"identity\", %q), got %+v", owner, call.resource)
+	}
+}
+
+func TestHTTP_ListFileObjects_CallerMatchSucceeds(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo1 := createTestFileObject(t, svc, owner, []byte("one"))
+	fo2 := createTestFileObject(t, svc, owner, []byte("two"))
+	_ = createTestFileObject(t, svc, stranger, []byte("not-mine"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", owner, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when requesting_subject matches caller, got %d", resp.StatusCode)
+	}
+	var out ListFileObjectsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(out.FileObjects) != 2 {
+		t.Fatalf("expected exactly owner's 2 file objects, got %d: %+v", len(out.FileObjects), out.FileObjects)
+	}
+	got := map[string]bool{}
+	for _, fo := range out.FileObjects {
+		got[fo.FileObjectID] = true
+	}
+	if !got[fo1.FileObjectID] || !got[fo2.FileObjectID] {
+		t.Fatalf("expected both of owner's file objects present, got %+v", out.FileObjects)
+	}
+}
+
+// TestHTTP_ListFileObjects_OwnerMismatchStillRejectedByServiceLayer proves
+// the service-level check (Service.ListFileObjects) still holds even when
+// the HTTP-level check alone would have let a request through: caller and
+// requesting_subject agree (so the HTTP-level check passes), but Owner names
+// someone else — this must still be rejected, by the service layer's own
+// requesting_subject == owner check, and audited.
+func TestHTTP_ListFileObjects_OwnerMismatchStillRejectedByServiceLayer(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// Verified caller is mallory, and the request truthfully names mallory
+	// as requesting_subject (passes the HTTP-level check) — but claims
+	// owner=alice, attempting to enumerate alice's inventory.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", stranger, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: stranger,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for owner != requesting_subject, got %d", resp.StatusCode)
+	}
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the service-level rejection to be audited")
+	}
+	if call.action != listDeniedAction || call.actor != stranger || call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("unexpected audit call: %+v", call)
+	}
+}
+
 // --- Missing caller header (401, distinct from a mismatch's 403), across
-// all ten routes ---
+// all eleven routes ---
 
 func TestHTTP_MissingCallerHeaderRejected(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
@@ -460,6 +576,7 @@ func TestHTTP_MissingCallerHeaderRejected(t *testing.T) {
 		{"set_file_metadata", "/file-objects/metadata/set", SetFileMetadataRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner, Name: &newName}},
 		{"export_file", "/file-objects/export", ExportFileRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}},
 		{"delete_file_object", "/file-objects/delete", DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}},
+		{"list_file_objects", "/file-objects/list", ListFileObjectsRequest{Owner: owner, RequestingSubject: owner}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

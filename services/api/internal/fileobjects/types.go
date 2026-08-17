@@ -393,3 +393,25 @@ type DeleteFileObjectRequest struct {
 }
 
 type DeleteFileObjectResponse struct{}
+
+// ListFileObjectsRequest/Response back the ListFileObjects RPC (charter §3,
+// added 2026-08-18) — a self-only "what do I own" inventory listing,
+// deliberately not CheckPermission-gated (mirrors Storage's ExportAllBlobs
+// precedent exactly). Owner and RequestingSubject are BOTH request fields,
+// but per the charter's corrected authorization discipline neither is ever
+// trusted as self-asserted: Service.ListFileObjects rejects unless
+// RequestingSubject == Owner, and http.go's handler independently rejects
+// unless RequestingSubject == the verified network caller, before Service
+// logic ever runs. See docs/DECISION_LOG.md, 2026-08-18, "ListFileObjects:
+// Security Steward veto and fix" for why both checks are required.
+type ListFileObjectsRequest struct {
+	Owner             string
+	RequestingSubject string
+}
+
+// ListFileObjectsResponse reuses the existing FileObject shape unchanged —
+// no BlobRef field exists on it (charter §3: "introduces no new field and
+// therefore reopens none of §6 point 8's three closed leak paths").
+type ListFileObjectsResponse struct {
+	FileObjects []FileObject
+}
