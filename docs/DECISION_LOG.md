@@ -1970,3 +1970,21 @@ Added `ListFileObjects(owner, requesting_subject) -> [file_object]` to `docs/cap
 
 ---
 
+### 2026-08-18 — ListFileObjects: Security Steward veto and fix (real authorization bypass caught at charter stage)
+
+**Decision:** Security Steward independently vetoed the `ListFileObjects` amendment, having caught a genuine, complete authorization bypass in the drafted charter text — not implemented code, but the design itself. As written, §3 specified only `requesting_subject == owner` as a self-consistency check between two request fields, with neither ever bound to the actual verified network caller. Any caller could have sent `owner=requesting_subject=<victim>` and received the victim's entire file inventory once implemented to the letter of that text. Caught by tracing `Storage.ExportAllBlobs`'s real implementation (`storage/export.go`, `storage/http_test.go`) rather than trusting the charter's own claim of an "exact" parallel to it — that RPC has a second, HTTP-layer caller-identity check the drafted `ListFileObjects` text never mentioned.
+
+Two further findings in the same pass: the denial-audit requirement (already added after Constitution Warden's earlier block, this file's previous entry) needed broadening to cover both the service-level and HTTP-level rejection cases, not just one; and §7's "shared to me" bullet was **factually wrong**, not conservatively scoped — it claimed no Permissions-side reverse-index primitive existed, when `Permissions.ListGrants(subject)` already does, is implemented, and is network-mounted (`GET /v1/permissions/grants/subject`), verified directly against real code. Composing "shared with me" from it is a deliberate, small, later scope exclusion (filter + hydrate via `GetFileMetadata`), not a capability blocked on a future Permissions amendment — genuinely better news for the roadmap than the original (wrong) claim suggested.
+
+All fixed in the charter text (§3, §4, §7, §8's amendment gate table) — see the charter file for the corrected text. Security Steward's non-blocking re-checks (blob_ref leak paths, unbounded-result-set precedent) all independently confirmed clean.
+
+**Rationale:** This is exactly what a charter-stage guardian gate is for — an authorization bypass caught here costs a text edit; the same bug caught after implementation would have cost a real vulnerability in a shipped RPC. Worth naming plainly: my own first draft of this amendment, despite explicitly modeling it on an existing precedent, got the security-critical half of that precedent wrong. The gate did its job.
+
+**Article(s) invoked:** Art. 7 (a self-only operation's authorization must actually be enforced against the verified caller, not merely asserted as request-field self-consistency), Art. 5 (broadened denial auditing), Art. 10 (the "shared to me" correction keeps the eventual composition inside File Objects' own surface, not a new cross-capability dependency).
+
+**Made by:** Security Steward (the veto and its findings), Chief Architect (the charter fix).
+
+**Guardian gate:** Both PASS. `ListFileObjects` is now ready for implementation.
+
+---
+
