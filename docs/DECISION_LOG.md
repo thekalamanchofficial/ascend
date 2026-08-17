@@ -1898,3 +1898,15 @@ One real, non-blocking finding, fixed the same day: `apps/mobile`'s `removeDevic
 
 ---
 
+### 2026-08-18 — Fixed `apps/mobile`'s entry point: package.json's `main` pointed at a file that never existed
+
+**Decision:** Changed `apps/mobile/package.json`'s `"main"` field from `"index.ts"` (no such file ever existed in this project) to `"expo/AppEntry"` (the standard Expo entry-point convention for a plain `App.tsx`-rooted app, not using Expo Router), which resolves and registers `App.tsx`'s default export.
+
+**Rationale:** Surfaced when the founder actually ran `expo start` for the first time — a real, pre-existing bug that every prior verification pass in this project's history had missed, because none of them actually launched Expo: `npm run typecheck` and `npm test` (the two checks every prior commit verified against) never touch `package.json`'s `main` field at all, since Jest and `tsc` don't use it. Confirmed the fix actually works, not just plausible, by bundling for real: `npx expo export --platform android` successfully resolved `expo/AppEntry.js` → `App.tsx` → `AppNavigator` and bundled all 685 modules (crypto, identity, sessionauth, navigation, screens included) with no errors — the first time this app has been proven to actually launch, as opposed to merely typecheck and unit-test clean.
+
+**Article(s) invoked:** Art. 12 (the app should just work when launched — "simple by default" applies to development ergonomics too, not only end-user UX).
+
+**Made by:** Chief Architect.
+
+---
+
