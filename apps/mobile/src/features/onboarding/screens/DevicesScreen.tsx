@@ -1,0 +1,218 @@
+// Devices screen — the one place a user manages device/session state, per
+// session-authentication.charter.md §5's "Devices/Sessions composition"
+// section (binding on this UI layout, per this pass's brief): "there is no
+// separate top-level 'Sessions' screen... its rows stay device-level...
+// 'sign out everywhere' is the one exception: a single, clearly-labeled,
+// identity-level action... stays on the same screen." A device's row shows
+// freshness via last_used_at (Session/Request Authentication's more
+// precise timestamp) superseding Identity's own last_seen where available,
+// exactly as that section allows ("an implementation choice, not a second
+// competing timestamp shown to the user").
+import * as React from "react";
+import { View, Text, Pressable, ActivityIndicator, ScrollView, Alert } from "react-native";
+import { useNavigation, useRoute, CommonActions } from "@react-navigation/native";
+import type { RouteProp } from "@react-navigation/native";
+import type { RootStackParamList, NativeStackNavigationProp } from "../../../navigation/types";
+import * as identity from "../../../capabilities/identity";
+import * as sessionauth from "../../../capabilities/sessionauth";
+import { removeDevice, signOutEverywhere } from "../onboarding";
+import type { Device } from "../../../capabilities/identity";
+import type { SessionSummary } from "../../../capabilities/sessionauth";
+
+type DevicesRouteProp = RouteProp<RootStackParamList, "Devices">;
+
+function formatUnixSeconds(unixSeconds: number): string {
+  if (!unixSeconds) return "—";
+  return new Date(unixSeconds * 1000).toLocaleString();
+}
+
+export function DevicesScreen() {
+  const navigation = useNavigation<NativeStackNavigationProp>();
+  const route = useRoute<DevicesRouteProp>();
+  const { identityRef, deviceId: thisDeviceId, sessionToken, displayName } = route.params;
+
+  const [devices, setDevices] = React.useState<Device[]>([]);
+  const [sessions, setSessions] = React.useState<SessionSummary[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+  const [exportText, setExportText] = React.useState<{ title: string; text: string } | null>(null);
+  const [busyAction, setBusyAction] = React.useState<string | null>(null);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [devicesResp, sessionsResp] = await Promise.all([
+        identity.listDevices({ identityRef }, sessionToken),
+        sessionauth.listActiveSessions(sessionToken),
+      ]);
+      setDevices(devicesResp.devices);
+      setSessions(sessionsResp.sessions);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [identityRef, sessionToken]);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  const lastUsedByDevice = React.useMemo(() => {
+    const map = new Map<string, number>();
+    for (const s of sessions) {
+      const existing = map.get(s.deviceId) ?? 0;
+      if (s.lastUsedAtUnix > existing) map.set(s.deviceId, s.lastUsedAtUnix);
+    }
+    return map;
+  }, [sessions]);
+
+  function confirmRemoveDevice(device: Device) {
+    Alert.alert(
+      "Remove device",
+      `Remove "${device.name}"? This revokes its Identity binding. Note: any session already issued to this ` +
+        `device remains valid until it naturally expires — see this pass's known gap, documented in ` +
+        `identity/index.ts's revokeDevice and docs/DECISION_LOG.md.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: async () => {
+            setBusyAction(`remove:${device.deviceId}`);
+            try {
+              await removeDevice(identityRef, device.deviceId, sessionToken);
+              await load();
+            } catch (err) {
+              setError(err instanceof Error ? err.message : String(err));
+            } finally {
+              setBusyAction(null);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  async function handleExportIdentity() {
+    setBusyAction("exportIdentity");
+    try {
+      const resp = await identity.exportIdentity({ identityRef }, sessionToken);
+      setExportText({ title: `Identity export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleExportSessions() {
+    setBusyAction("exportSessions");
+    try {
+      const resp = await sessionauth.exportSessions(sessionToken);
+      setExportText({ title: `Sessions export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  function confirmSignOutEverywhere() {
+    Alert.alert("Sign out everywhere", "This revokes every session for your identity, including this one.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Sign out everywhere",
+        style: "destructive",
+        onPress: async () => {
+          setBusyAction("signOutEverywhere");
+          try {
+            await signOutEverywhere(sessionToken);
+            navigation.dispatch(
+              CommonActions.reset({ index: 0, routes: [{ name: "CreateIdentity" }] }),
+            );
+          } catch (err) {
+            setError(err instanceof Error ? err.message : String(err));
+            setBusyAction(null);
+          }
+        },
+      },
+    ]);
+  }
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 24, gap: 16 }}>
+      <Text style={{ fontSize: 20, fontWeight: "600" }}>Devices</Text>
+      <Text>{displayName}</Text>
+
+      {loading ? <ActivityIndicator /> : null}
+      {error ? <Text style={{ color: "#b00020" }}>{error}</Text> : null}
+
+      {devices.map((device) => {
+        const lastUsed = lastUsedByDevice.get(device.deviceId);
+        return (
+          <View key={device.deviceId} style={{ borderWidth: 1, borderColor: "#ccc", borderRadius: 8, padding: 12, gap: 4 }}>
+            <Text style={{ fontWeight: "600" }}>
+              {device.name} {device.deviceId === thisDeviceId ? "(this device)" : ""}
+            </Text>
+            <Text>Added: {formatUnixSeconds(device.addedAtUnix)}</Text>
+            <Text>
+              Last active: {formatUnixSeconds(lastUsed ?? device.lastSeenUnix)}
+              {lastUsed ? "" : " (no active session)"}
+            </Text>
+            <Pressable
+              disabled={busyAction === `remove:${device.deviceId}`}
+              onPress={() => confirmRemoveDevice(device)}
+              style={{ alignSelf: "flex-start", marginTop: 4 }}
+            >
+              <Text style={{ color: "#b00020" }}>
+                {busyAction === `remove:${device.deviceId}` ? "Removing…" : "Remove device"}
+              </Text>
+            </Pressable>
+          </View>
+        );
+      })}
+
+      <View style={{ gap: 8, marginTop: 8 }}>
+        <Pressable
+          disabled={busyAction === "exportIdentity"}
+          onPress={handleExportIdentity}
+          style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+        >
+          <Text>{busyAction === "exportIdentity" ? "Exporting…" : "Export identity"}</Text>
+        </Pressable>
+
+        <Pressable
+          disabled={busyAction === "exportSessions"}
+          onPress={handleExportSessions}
+          style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+        >
+          <Text>{busyAction === "exportSessions" ? "Exporting…" : "Export sessions"}</Text>
+        </Pressable>
+
+        <Pressable
+          disabled={busyAction === "signOutEverywhere"}
+          onPress={confirmSignOutEverywhere}
+          style={{ backgroundColor: "#b00020", padding: 12, borderRadius: 8, alignItems: "center" }}
+        >
+          <Text style={{ color: "white", fontWeight: "600" }}>
+            {busyAction === "signOutEverywhere" ? "Signing out…" : "Sign out everywhere"}
+          </Text>
+        </Pressable>
+      </View>
+
+      {exportText ? (
+        <View style={{ borderWidth: 1, borderColor: "#333", borderRadius: 8, padding: 12, gap: 8 }}>
+          <Text style={{ fontWeight: "600" }}>{exportText.title}</Text>
+          <Text selectable style={{ fontFamily: "monospace", fontSize: 12 }}>
+            {exportText.text}
+          </Text>
+          <Pressable onPress={() => setExportText(null)}>
+            <Text style={{ textDecorationLine: "underline" }}>Close</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </ScrollView>
+  );
+}
