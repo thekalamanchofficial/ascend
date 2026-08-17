@@ -144,6 +144,13 @@ export function DevicesScreen() {
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Devices</Text>
       <Text>{displayName}</Text>
 
+      <Pressable
+        onPress={() => navigation.navigate("Files", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>Files</Text>
+      </Pressable>
+
       {loading ? <ActivityIndicator /> : null}
       {error ? <Text style={{ color: "#b00020" }}>{error}</Text> : null}
 
