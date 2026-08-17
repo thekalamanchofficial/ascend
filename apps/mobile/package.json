@@ -2,7 +2,7 @@
   "name": "@ascend/mobile",
   "version": "0.0.0",
   "private": true,
-  "main": "expo/AppEntry",
+  "main": "index.ts",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",

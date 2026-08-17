@@ -1910,3 +1910,19 @@ One real, non-blocking finding, fixed the same day: `apps/mobile`'s `removeDevic
 
 ---
 
+### 2026-08-18 — Superseded: `"main": "expo/AppEntry"` broke on Windows; replaced with a local `index.ts`
+
+**Decision:** The prior fix (this same file, previous entry) resolved the missing-`main` crash but introduced a second, Windows-specific bug: resolving the bare specifier `"expo/AppEntry"` for the manifest's `mainModuleName` field produced a **backslash-separated** path (`node_modules\expo\AppEntry`), URL-encoded into the bundle request as `node_modules%5Cexpo%5CAppEntry.bundle` — Expo Go's own manifest/update-loading validation rejects this as unresolvable (the exact same `ConfigError: Cannot resolve entry file` message as the original bug, from a different cause), confirmed live via `adb logcat` against a real Android emulator (`dev.expo.updates`/`LoaderTask` logging `Failed to download remote update... {"error":"ConfigError: Cannot resolve entry file..."}`) — not assumed from the CLI's own success on the developer's non-Windows-path-sensitive `expo export` check, which had passed and masked this.
+
+Fixed by creating `apps/mobile/index.ts` (a plain local file mirroring `node_modules/expo/AppEntry.js`'s own two lines: `registerRootComponent(App)` from `./App`) and pointing `main` back at it. A local, relative entry file resolves through Metro's ordinary project-root module resolution, not the bare-specifier/node_modules resolution path that produced the backslash corruption — confirmed live: a throwaway `expo start --port 8090` instance's manifest now reports `mainModuleName: "index.ts"` and `launchAsset.url` with clean forward slashes, and the bundle itself (`GET .../index.ts.bundle?...`) returns `200`.
+
+**Rationale:** `expo/AppEntry` is a valid, common convention and works fine on macOS/Linux — this is specifically a Windows path-separator bug in how this Expo CLI version computes `mainModuleName` from a bare package specifier. A local `index.ts` (the more common convention in actual Expo project templates anyway) sidesteps it entirely rather than working around Expo CLI internals.
+
+**Article(s) invoked:** Art. 12 (same as the superseded entry — verified against a real device/emulator this time, not just a bundler-level check, since that's what actually caught this).
+
+**Made by:** Chief Architect.
+
+**Supersedes:** the immediately preceding entry, "Fixed `apps/mobile`'s entry point: package.json's `main` pointed at a file that never existed" — that entry's diagnosis (the missing file) was correct and remains true; its specific fix (`expo/AppEntry`) is what's replaced here.
+
+---
+
