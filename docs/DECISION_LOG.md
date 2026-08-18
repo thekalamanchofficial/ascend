@@ -2075,3 +2075,17 @@ Fixed with a single global polyfill import rather than patching each call site �
 
 ---
 
+### 2026-08-18 — Export identity/sessions now save a real file, not just an on-screen text dump
+
+**Decision:** Added `expo-sharing` and wired `apps/mobile/src/features/onboarding/screens/DevicesScreen.tsx`'s `handleExportIdentity`/`handleExportSessions` through a new shared helper, `saveAndShareExport`: writes the export text to a real file in app-private storage via `expo-file-system` (`ascend-identity-export-<identityRef>.json` / `ascend-sessions-export-<identityRef>.json`), then hands it to the OS share/save sheet via `expo-sharing` — the standard Expo pattern for getting a file out of a sandboxed app on Android/iOS, since there is no direct "download to Downloads folder" API on either platform. Falls back to showing the raw export text on-screen only if `Sharing.isAvailableAsync()` is genuinely false, so the export never silently produces nothing.
+
+**Rationale:** The founder's own framing: "a text file should be downloaded on the users system so that they can use it in future" — the prior behavior (a scrollable `<Text>` block of raw JSON) satisfied Art. 9's letter (the data is retrievable) but not its intent (a complete, durable, independently-usable artifact) — a screen you can't easily get off the device isn't a real export.
+
+**Live-verified, not just typechecked:** brought up a fresh emulator session, created a new identity through the real UI end-to-end, reached the Devices screen, tapped "Export identity" — the real Android share sheet appeared ("Sharing 1 file", `ascend-identity-export-<uuid>.json`, with Drive/Gmail/Quick Share as real destinations), confirmed via screenshot; dismissed it and confirmed the app's own status banner read correctly. Repeated for "Export sessions" — same real share sheet, `ascend-sessions-export-<uuid>.json`. Both genuinely produce a real file a user can save wherever they choose, not a screen.
+
+**Article(s) invoked:** Art. 9 (a real, durable, independently-usable export artifact — not merely technically-retrievable data), Art. 1 (the user, not the app, decides where their exported data ends up — Drive, email, local storage, wherever the OS share sheet lets them choose).
+
+**Made by:** Chief Architect.
+
+---
+

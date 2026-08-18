@@ -12,12 +12,39 @@ import * as React from "react";
 import { View, Text, Pressable, ActivityIndicator, ScrollView, Alert } from "react-native";
 import { useNavigation, useRoute, CommonActions } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
+import * as FileSystem from "expo-file-system";
+import * as Sharing from "expo-sharing";
 import type { RootStackParamList, NativeStackNavigationProp } from "../../../navigation/types";
 import * as identity from "../../../capabilities/identity";
 import * as sessionauth from "../../../capabilities/sessionauth";
 import { removeDevice, signOutEverywhere } from "../onboarding";
 import type { Device } from "../../../capabilities/identity";
 import type { SessionSummary } from "../../../capabilities/sessionauth";
+
+// Art. 9 (export) means a real, durable, usable artifact — not a screen the
+// user has to copy-paste or screenshot. Writes the export text to a real
+// file in app-private storage, then hands it to the OS share/save sheet
+// (the standard Expo pattern for getting a file OUT of a sandboxed app on
+// Android/iOS — there is no direct "download to Downloads folder" API)
+// so the user picks where it actually lands (Files, Drive, email, etc.).
+// Falls back to returning the text unsaved only if sharing is genuinely
+// unavailable on this device, so the caller can still show something
+// rather than the export silently going nowhere.
+async function saveAndShareExport(
+  filename: string,
+  text: string,
+  dialogTitle: string,
+): Promise<{ shared: true } | { shared: false; text: string }> {
+  const fileUri = `${FileSystem.documentDirectory}${filename}`;
+  await FileSystem.writeAsStringAsync(fileUri, text, { encoding: FileSystem.EncodingType.UTF8 });
+
+  if (!(await Sharing.isAvailableAsync())) {
+    return { shared: false, text };
+  }
+
+  await Sharing.shareAsync(fileUri, { mimeType: "application/json", dialogTitle });
+  return { shared: true };
+}
 
 type DevicesRouteProp = RouteProp<RootStackParamList, "Devices">;
 
@@ -35,7 +62,11 @@ export function DevicesScreen() {
   const [sessions, setSessions] = React.useState<SessionSummary[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
-  const [exportText, setExportText] = React.useState<{ title: string; text: string } | null>(null);
+  // Unsaved-fallback text (only ever populated if the OS share sheet is
+  // genuinely unavailable — see saveAndShareExport) and a brief status
+  // message for the normal, successful-save case.
+  const [exportFallback, setExportFallback] = React.useState<{ title: string; text: string } | null>(null);
+  const [exportStatus, setExportStatus] = React.useState<string | null>(null);
   const [busyAction, setBusyAction] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
@@ -95,9 +126,18 @@ export function DevicesScreen() {
 
   async function handleExportIdentity() {
     setBusyAction("exportIdentity");
+    setExportFallback(null);
+    setExportStatus(null);
     try {
       const resp = await identity.exportIdentity({ identityRef }, sessionToken);
-      setExportText({ title: `Identity export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+      const text = new TextDecoder().decode(resp.exportBlob);
+      const filename = `ascend-identity-export-${identityRef}.json`;
+      const result = await saveAndShareExport(filename, text, "Save your identity export");
+      if (result.shared) {
+        setExportStatus(`Identity export (${resp.formatVersion}) saved as ${filename}.`);
+      } else {
+        setExportFallback({ title: `Identity export (${resp.formatVersion})`, text: result.text });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -107,9 +147,18 @@ export function DevicesScreen() {
 
   async function handleExportSessions() {
     setBusyAction("exportSessions");
+    setExportFallback(null);
+    setExportStatus(null);
     try {
       const resp = await sessionauth.exportSessions(sessionToken);
-      setExportText({ title: `Sessions export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+      const text = new TextDecoder().decode(resp.exportBlob);
+      const filename = `ascend-sessions-export-${identityRef}.json`;
+      const result = await saveAndShareExport(filename, text, "Save your sessions export");
+      if (result.shared) {
+        setExportStatus(`Sessions export (${resp.formatVersion}) saved as ${filename}.`);
+      } else {
+        setExportFallback({ title: `Sessions export (${resp.formatVersion})`, text: result.text });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -207,13 +256,23 @@ export function DevicesScreen() {
         </Pressable>
       </View>
 
-      {exportText ? (
+      {exportStatus ? (
         <View style={{ borderWidth: 1, borderColor: "#333", borderRadius: 8, padding: 12, gap: 8 }}>
-          <Text style={{ fontWeight: "600" }}>{exportText.title}</Text>
+          <Text>{exportStatus}</Text>
+          <Pressable onPress={() => setExportStatus(null)}>
+            <Text style={{ textDecorationLine: "underline" }}>Close</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {exportFallback ? (
+        <View style={{ borderWidth: 1, borderColor: "#333", borderRadius: 8, padding: 12, gap: 8 }}>
+          <Text style={{ fontWeight: "600" }}>{exportFallback.title}</Text>
+          <Text>Saving/sharing isn't available on this device — here's the export text to copy manually.</Text>
           <Text selectable style={{ fontFamily: "monospace", fontSize: 12 }}>
-            {exportText.text}
+            {exportFallback.text}
           </Text>
-          <Pressable onPress={() => setExportText(null)}>
+          <Pressable onPress={() => setExportFallback(null)}>
             <Text style={{ textDecorationLine: "underline" }}>Close</Text>
           </Pressable>
         </View>
