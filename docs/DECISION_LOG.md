@@ -2059,3 +2059,19 @@ Unlike `onboarding/__tests__/liveSmoke.test.ts`'s header comment (which states i
 
 ---
 
+### 2026-08-18 — Global TextEncoder/TextDecoder polyfill: found live by the founder clicking Export Identity
+
+**Decision:** Added `fast-text-encoding` (self-installing polyfill) as the first import in `apps/mobile/index.ts`, before `registerRootComponent`/`App` are ever imported.
+
+**Rationale:** The founder hit a real, live runtime crash — "Property 'TextDecoder' doesn't exist" — tapping Export Identity on a real Android emulator. Investigated and found `TextEncoder`/`TextDecoder` are used in 8+ files across this codebase (`crypto/envelope.ts`, `crypto/ratchet.ts`, `crypto/mnemonic.ts`, `crypto/auditHash.ts`, `crypto/index.ts`, `identity/index.ts`, `sessionauth/index.ts`, `onboarding/localSession.ts`, `vault/screens/FileDetailScreen.tsx`), several at module-load time, not just inside functions. Hermes (React Native's JS engine) provides `TextEncoder` on this build but not `TextDecoder` — an asymmetry specific to the engine, invisible to every prior test run because Jest executes under Node, which has both natively. This is exactly the same class of bug this session has repeatedly found (entry-point resolution, Metro monorepo detection, Reanimated crash) — passes every mechanical check, only fails on an actual device, because nothing before this session had actually run the app on one.
+
+Fixed with a single global polyfill import rather than patching each call site — `fast-text-encoding` only fills in what's actually missing (existing native `TextEncoder` untouched), so every current and future use of either API across the whole app is covered by one line, not a per-file fix that the next new module could easily miss.
+
+**Live-verified, not just typechecked/tested:** brought up a real emulator session (fresh Metro instance, `--clear`, real backend), created a brand new identity end-to-end (crypto key generation → `CreateIdentity` → `BindDevice` → session issuance, all confirmed via live `adb logcat` audit events), reached the Devices screen, and tapped the exact "Export identity" button that had crashed — `identity_exported` audit event fired cleanly, and the exported JSON rendered correctly on screen (screenshotted). No crash, on the same code path the founder hit.
+
+**Article(s) invoked:** Art. 9 (export must actually work, not just exist in the code), Art. 12 (an app-breaking crash on a core, advertised action is the opposite of "just works").
+
+**Made by:** Chief Architect.
+
+---
+
