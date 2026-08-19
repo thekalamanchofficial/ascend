@@ -2263,3 +2263,15 @@ Track 2 of "cover UI gaps" (Permissions mobile integration) is closed.
 Track 3 of "cover UI gaps" (Audit mobile integration) is closed. All three tracks of this pass are now complete.
 
 ---
+
+### 2026-08-19 — CI fix: `buf breaking` git input path, not a capability decision
+
+**Problem:** `.github/workflows/constitution.yml`'s `contracts-breaking-change` job ran `buf breaking --against '.git#branch=main'` with `working-directory: packages/contracts`, so buf resolved `.git` relative to that subdirectory (`packages/contracts/.git`) instead of the repo's real `.git` at the root — failing every PR with "does not appear to be a git repository," never actually running the breaking-change check.
+
+**Fix:** `--against '../../.git#ref=origin/main,subdir=packages/contracts'` — points at the real root `.git` and uses buf's `subdir` option to scope the comparison to the contracts module within it. Also switched `branch=main` to `ref=origin/main`: `actions/checkout@v4` with `fetch-depth: 0` on a `pull_request` trigger fetches `main` only as the remote-tracking ref `origin/main`, not as a local branch, so `branch=main` was liable to fail to resolve even after the path fix.
+
+**Article(s) invoked:** none directly — mechanical CI plumbing for the Art. 10 breaking-change gate itself, not a capability or contract change.
+
+**Made by:** Chief Architect, on direct founder report of the failing check (no capability engineer or guardian gate needed — no charter/contract/behavior change).
+
+---
