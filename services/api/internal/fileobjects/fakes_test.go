@@ -124,6 +124,18 @@ type memPermissions struct {
 
 	grants map[grantKey]grantValue
 
+	// nextGrantedAt is a deterministic, monotonically increasing fake
+	// timestamp assigned to each GrantPermission call (real wall-clock
+	// time isn't needed for tests; a distinguishable, ordered value is —
+	// used by ListFileAccess's GrantedAtUnix-plumbing tests to prove the
+	// value that comes out the other end of
+	// fileobjects.PermissionGrant/wiring.go's real adapter actually
+	// traces back to Permissions' own real Grant.GrantedAtUnix field,
+	// rather than being silently dropped as it was before this
+	// amendment). Starts at 1000 so a zero-value GrantedAtUnix in a test
+	// assertion is unambiguously "never set", not "the first grant".
+	nextGrantedAt int64
+
 	grantFailFor    map[string]error // "subject\x1faction\x1fresourceType\x1fresourceID" -> forced error
 	revokeFailFor   map[string]error
 	listGrantsErr   map[string]error // "resourceType\x1fresourceID" -> forced error
@@ -140,8 +152,9 @@ type grantKey struct {
 }
 
 type grantValue struct {
-	scope   string
-	grantor string
+	scope         string
+	grantor       string
+	grantedAtUnix int64
 }
 
 func newMemPermissions() *memPermissions {
@@ -152,6 +165,7 @@ func newMemPermissions() *memPermissions {
 		grantFailFor:  make(map[string]error),
 		revokeFailFor: make(map[string]error),
 		listGrantsErr: make(map[string]error),
+		nextGrantedAt: 1000,
 	}
 }
 
@@ -228,7 +242,8 @@ func (m *memPermissions) GrantPermission(grantor, subject, action, resourceType,
 	if !hasOwner {
 		m.owners[rk] = grantor
 	}
-	m.grants[grantKey{subject, action, resourceType, resourceID}] = grantValue{scope: scope, grantor: grantor}
+	m.nextGrantedAt++
+	m.grants[grantKey{subject, action, resourceType, resourceID}] = grantValue{scope: scope, grantor: grantor, grantedAtUnix: m.nextGrantedAt}
 	return nil
 }
 
@@ -277,9 +292,9 @@ func (m *memPermissions) ListGrantsForResource(resourceType, resourceID string) 
 		return nil, err
 	}
 	var out []PermissionGrant
-	for k := range m.grants {
+	for k, v := range m.grants {
 		if k.resourceType == resourceType && k.resourceID == resourceID {
-			out = append(out, PermissionGrant{Subject: k.subject, Action: k.action, Scope: m.grants[k].scope})
+			out = append(out, PermissionGrant{Subject: k.subject, Action: k.action, Scope: v.scope, GrantedAtUnix: v.grantedAtUnix})
 		}
 	}
 	return out, nil

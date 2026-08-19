@@ -108,6 +108,167 @@ func (s *Service) checkRead(subject, fileObjectID, rpcName string) error {
 	return nil
 }
 
+// listDeniedAction is the audit action emitted on every ListFileObjects
+// rejection — service-level (requesting_subject != owner) or HTTP-level
+// (requesting_subject != verified caller, http.go) — per charter §3/§4's
+// broadened denial-auditing requirement (docs/DECISION_LOG.md, 2026-08-18,
+// "ListFileObjects: Security Steward veto and fix"). Named "file.list_..."
+// rather than "fileobjects...." to match the charter bullet's own literal
+// example action name.
+const listDeniedAction = "file.list_denied"
+
+// auditListDenied is ListFileObjects' single shared denial-audit call
+// site — deliberately callable from both this file (the service-level
+// requesting_subject/owner mismatch) and http.go (the HTTP-level
+// caller/requesting_subject mismatch), same package, so both rejection
+// reasons funnel through identical audit vocabulary (mirrors checkRead's
+// "one shared call site" discipline above). resource is always
+// ("identity", owner) — naming whose inventory was targeted, never a
+// file_object_id (charter §3: this is an account-level enumeration
+// attempt, not a single-file access attempt).
+func (s *Service) auditListDenied(actor, owner string) {
+	_, _ = s.audit.Emit(actor, listDeniedAction,
+		ResourceRef{ResourceType: "identity", ResourceID: owner},
+		"requesting_subject_mismatch", nil)
+}
+
+// ListFileObjects returns every FileObject owner has ever created —
+// deliberately NOT CheckPermission-gated (charter §3, mirroring Storage's
+// ExportAllBlobs precedent exactly): this is a self-only,
+// right-to-see-your-own-stuff inventory listing, not a shareable read.
+// Tombstoned (deleted) file objects are excluded — a "my files" listing
+// should show what a caller actually still has, not entries whose content
+// has already been irreversibly destroyed; GetFileHistory remains reachable
+// for a deleted file object if its file_object_id is already known by other
+// means (charter §3's own precedent for what stays resolvable post-delete).
+//
+// AUTHORIZATION (charter §3, corrected 2026-08-18 after Security Steward's
+// veto of the original draft — see docs/DECISION_LOG.md): this
+// requesting_subject == owner check is only ONE of two independent checks
+// required to actually close the authorization bypass caught at charter
+// stage. The second, EQUALLY REQUIRED check — requesting_subject == the
+// verified network caller — lives in http.go's handler and runs BEFORE this
+// method is ever called. Neither check alone is sufficient: this check
+// alone (as the charter's first draft specified) trusts both Owner and
+// RequestingSubject as self-asserted request fields, binding neither to who
+// is actually, verifiably making the call — a caller could send
+// owner=requesting_subject=<victim> and this check alone would pass.
+func (s *Service) ListFileObjects(req ListFileObjectsRequest) (ListFileObjectsResponse, error) {
+	if req.Owner == "" || req.RequestingSubject == "" {
+		return ListFileObjectsResponse{}, fmt.Errorf("%w: owner and requesting_subject are required", ErrInvalidArgument)
+	}
+	if req.RequestingSubject != req.Owner {
+		s.auditListDenied(req.RequestingSubject, req.Owner)
+		return ListFileObjectsResponse{}, ErrPermissionDenied
+	}
+
+	records := s.store.listFileObjectsByOwner(req.Owner)
+	out := make([]FileObject, 0, len(records))
+	for _, r := range records {
+		if r.Deleted {
+			continue
+		}
+		out = append(out, r.toFileObject())
+	}
+	return ListFileObjectsResponse{FileObjects: out}, nil
+}
+
+// accessListDeniedAction is the audit action emitted on every ListFileAccess
+// rejection — HTTP-level (requesting_subject != verified caller, http.go) or
+// service-level (the file object doesn't exist, OR it exists but
+// requesting_subject isn't its owner — charter §3's required
+// enumeration-oracle closure treats these two service-level cases
+// identically, on purpose; see auditAccessListDenied/ListFileAccess below).
+// Named "file.access_list_denied" per the charter bullet's own literal
+// example action name (distinct from checkRead's shared
+// "fileobjects.access_denied", and from ListFileObjects' "file.list_denied"
+// — this RPC is scoped to one file, so it is safe, and required by §3/§4, to
+// name the specific file_object_id in the audit resource, unlike
+// ListFileObjects' account-level ("identity", owner) resource).
+const accessListDeniedAction = "file.access_list_denied"
+
+// auditAccessListDenied is ListFileAccess's single shared denial-audit call
+// site — deliberately callable from both this file (the service-level
+// nonexistent-or-not-owned case) and http.go (the HTTP-level caller
+// mismatch), same package, so every rejection reason funnels through
+// identical audit vocabulary (mirrors auditListDenied's/checkRead's own
+// "one shared call site" discipline). resource is always
+// ("file_object", fileObjectID) — safe to name here (charter §3): the
+// caller already supplied this exact file_object_id themselves, so naming
+// it in the audit trail adds no enumeration surface beyond what the
+// caller's own request already carries.
+func (s *Service) auditAccessListDenied(actor, fileObjectID string) {
+	_, _ = s.audit.Emit(actor, accessListDeniedAction,
+		ResourceRef{ResourceType: resourceTypeFileObject, ResourceID: fileObjectID},
+		"requesting_subject_not_owner_or_file_not_found", nil)
+}
+
+// ListFileAccess returns every current Permissions grant on file_object_id
+// — "who has access to this file" (charter §3, proposed 2026-08-18, frozen
+// after two guardian gate rounds). Deliberately owner-only, and deliberately
+// File Objects' OWN access-control decision, not delegated to Permissions:
+// PermissionsClient.ListGrantsForResource is a pure, undecorated store read
+// with no decision logic of its own (charter §3's Art. 10 exception,
+// named alongside ListFileObjects' own self-only exception in §4) — File
+// Objects is entirely responsible for deciding who may see the result, and
+// the rule it enforces is narrow and hardcoded: only the file's owner may
+// see the full grant list (a write collaborator can already edit content,
+// but seeing every other grantee's identity is reasoned in the charter as a
+// distinct, more sensitive disclosure — Art. 7 least privilege).
+//
+// AUTHORIZATION: like ListFileObjects, this is only ONE of two independent
+// checks. This method's requesting_subject == (resolved) owner check is the
+// service-level half; the HTTP-level half — requesting_subject == the
+// verified network caller — lives in http.go's handler and runs BEFORE this
+// method is ever called. Owner is NEVER a request field (types.go's
+// ListFileAccessRequest doc comment) — it is resolved here via a
+// server-side lookup of FileObjectRecord.Owner, never from anything a
+// caller supplies.
+//
+// ENUMERATION-ORACLE CLOSURE (charter §3, Security Steward gate finding,
+// required and test-backed): a nonexistent file_object_id and an
+// existing-but-not-owned file_object_id are handled by the exact same code
+// path below — same ErrPermissionDenied sentinel (same HTTP status, same
+// generic error body once http.go maps it), same auditAccessListDenied call
+// with identical shape. This method must never branch into
+// ErrFileObjectNotFound for one case and ErrPermissionDenied for the other —
+// doing so would let any authenticated caller sweep file_object_id values
+// and learn which ones exist anywhere on the platform, for files they have
+// no relationship to at all.
+func (s *Service) ListFileAccess(req ListFileAccessRequest) (ListFileAccessResponse, error) {
+	if req.FileObjectID == "" || req.RequestingSubject == "" {
+		return ListFileAccessResponse{}, fmt.Errorf("%w: file_object_id and requesting_subject are required", ErrInvalidArgument)
+	}
+
+	fo, found := s.store.getFileObject(req.FileObjectID)
+	if !found || fo.Owner != req.RequestingSubject {
+		// Deliberately the SAME rejection, regardless of which of the two
+		// conditions above is true — see the enumeration-oracle closure
+		// note above.
+		s.auditAccessListDenied(req.RequestingSubject, req.FileObjectID)
+		return ListFileAccessResponse{}, ErrPermissionDenied
+	}
+
+	// Resource-type invariant (charter §3): always the literal
+	// resourceTypeFileObject constant ("file_object"), never derived from a
+	// request field — this RPC cannot become a back-door way to query
+	// Permissions' "blob" namespace or any future resource type.
+	grants, err := s.perms.ListGrantsForResource(resourceTypeFileObject, req.FileObjectID)
+	if err != nil {
+		return ListFileAccessResponse{}, fmt.Errorf("fileobjects: listing access grants failed: %w", err)
+	}
+	out := make([]AccessGrant, 0, len(grants))
+	for _, g := range grants {
+		out = append(out, AccessGrant{
+			Subject:       g.Subject,
+			Action:        g.Action,
+			Scope:         g.Scope,
+			GrantedAtUnix: g.GrantedAtUnix,
+		})
+	}
+	return ListFileAccessResponse{Grants: out}, nil
+}
+
 // CreateFileObject allocates identity, stores version 1's content, and
 // bootstraps both Permissions resource namespaces this capability owns
 // (charter §6 point 2): the owner's first grant on

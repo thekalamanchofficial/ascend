@@ -3,6 +3,7 @@ package fileobjects
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -761,5 +762,406 @@ func TestDeleteFileObject_DeniedWithoutWriteGrant(t *testing.T) {
 	_, err := svc.DeleteFileObject(DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: stranger})
 	if !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("expected ErrPermissionDenied, got %v", err)
+	}
+}
+
+// --- ListFileObjects (charter §3, added 2026-08-18) -------------------
+
+// TestListFileObjects_HappyPath_OwnerGetsExactlyTheirOwnFileObjects proves
+// an owner with several file objects gets exactly those back, and that
+// another identity's file objects are absent — the core "my files" use case
+// this RPC exists for.
+func TestListFileObjects_HappyPath_OwnerGetsExactlyTheirOwnFileObjects(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+
+	fo1 := createTestFileObject(t, svc, owner, []byte("one"))
+	fo2 := createTestFileObject(t, svc, owner, []byte("two"))
+	fo3 := createTestFileObject(t, svc, owner, []byte("three"))
+	// Another identity's own file object must never appear in owner's list.
+	_ = createTestFileObject(t, svc, stranger, []byte("not-mine"))
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 3 {
+		t.Fatalf("expected exactly 3 file objects for owner, got %d: %+v", len(resp.FileObjects), resp.FileObjects)
+	}
+	got := map[string]bool{}
+	for _, fo := range resp.FileObjects {
+		if fo.Owner != owner {
+			t.Fatalf("ListFileObjects(owner=%q) returned a file object owned by %q", owner, fo.Owner)
+		}
+		got[fo.FileObjectID] = true
+	}
+	for _, want := range []string{fo1.FileObjectID, fo2.FileObjectID, fo3.FileObjectID} {
+		if !got[want] {
+			t.Fatalf("expected file_object_id %q in owner's list, got %+v", want, resp.FileObjects)
+		}
+	}
+
+	// stranger's own list must not include any of owner's file objects.
+	strangerResp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: stranger, RequestingSubject: stranger})
+	if err != nil {
+		t.Fatalf("ListFileObjects (stranger): %v", err)
+	}
+	if len(strangerResp.FileObjects) != 1 {
+		t.Fatalf("expected exactly 1 file object for stranger, got %d: %+v", len(strangerResp.FileObjects), strangerResp.FileObjects)
+	}
+}
+
+// TestListFileObjects_ExcludesTombstonedFileObjects documents and proves
+// this implementation's choice (service.go's doc comment): a deleted file
+// object's content is gone, so ListFileObjects excludes it from the "my
+// files" inventory even though the record itself is retained as a
+// tombstone.
+func TestListFileObjects_ExcludesTombstonedFileObjects(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	if _, err := svc.DeleteFileObject(DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}); err != nil {
+		t.Fatalf("DeleteFileObject: %v", err)
+	}
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 0 {
+		t.Fatalf("expected the tombstoned file object to be excluded, got %+v", resp.FileObjects)
+	}
+}
+
+// TestListFileObjects_ServiceLevelMismatchRejectedAndAudited is the
+// service-level half of charter §3's required two-layer authorization
+// discipline: requesting_subject != owner must be rejected, and the
+// rejection must be audited (action file.list_denied, actor the caller who
+// attempted the mismatched call, resource ("identity", owner) — never a
+// file_object_id).
+func TestListFileObjects_ServiceLevelMismatchRejectedAndAudited(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: stranger})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied for requesting_subject != owner, got %v", err)
+	}
+	if len(resp.FileObjects) != 0 {
+		t.Fatalf("expected no file objects returned on rejection, got %+v", resp.FileObjects)
+	}
+
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the service-level rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != listDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", listDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the caller who attempted the mismatched call (%q), got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("expected audit resource (\"identity\", %q) naming the targeted owner, got %+v", owner, call.resource)
+	}
+}
+
+// TestListFileObjects_EmptyFieldsRejected covers the ordinary required-field
+// validation, matching this package's other RPCs' precedent.
+func TestListFileObjects_EmptyFieldsRejected(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	if _, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: "", RequestingSubject: owner}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty owner, got %v", err)
+	}
+	if _, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: ""}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty requesting_subject, got %v", err)
+	}
+}
+
+// TestListFileObjects_ResponseNeverContainsBlobRef is charter §3's own
+// established paranoia about this specific leak (§6 point 8), applied to
+// this new RPC — trivial since FileObject (types.go) structurally has no
+// BlobRef field at all, but asserted explicitly rather than only relying on
+// "it compiles", matching blob_ref_leak_test.go's own precedent.
+func TestListFileObjects_ResponseNeverContainsBlobRef(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	versions := storeVersionsFor(t, svc, fo.FileObjectID)
+	if len(versions) != 1 || versions[0].BlobRef == "" {
+		t.Fatalf("setup failed: expected exactly one version with a blob_ref, got %+v", versions)
+	}
+	blobRef := versions[0].BlobRef
+
+	resp, err := svc.ListFileObjects(ListFileObjectsRequest{Owner: owner, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileObjects: %v", err)
+	}
+	if len(resp.FileObjects) != 1 {
+		t.Fatalf("expected exactly 1 file object, got %d", len(resp.FileObjects))
+	}
+	// FileObject (types.go) has no BlobRef field — reflect over it to prove
+	// that structurally, not just by inspecting the fields this test happens
+	// to know about.
+	rv := reflect.ValueOf(resp.FileObjects[0])
+	for i := 0; i < rv.NumField(); i++ {
+		fieldName := rv.Type().Field(i).Name
+		if strings.EqualFold(fieldName, "BlobRef") {
+			t.Fatalf("FileObject must never have a BlobRef field, found %q", fieldName)
+		}
+		if s, ok := rv.Field(i).Interface().(string); ok && s == blobRef {
+			t.Fatalf("field %q unexpectedly equals a real blob_ref (%q) — leak", fieldName, blobRef)
+		}
+	}
+}
+
+// --- ListFileAccess (charter §3, proposed/frozen 2026-08-18) ------------
+
+// TestListFileAccess_OwnerHappyPath proves the owner-only happy path, and
+// — the required, previously-unbacked plumbing (docs/DECISION_LOG.md,
+// "File Objects contract amendment: ListFileAccess, round 1/round 2") —
+// that GrantedAtUnix actually makes it from Permissions' real Grant type,
+// through fileobjects.PermissionGrant, into AccessGrant, rather than being
+// silently dropped the way it was before this amendment.
+func TestListFileAccess_OwnerHappyPath(t *testing.T) {
+	svc, _, perms, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	if _, err := svc.SetFilePermissions(SetFilePermissionsRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: owner, Grant: true,
+		Subject: collaborator, Action: ActionRead, Scope: "read",
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	resp, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileAccess: %v", err)
+	}
+
+	// Owner's own bootstrap read+write grants, plus collaborator's mirrored
+	// read grant — exactly 3 rows.
+	if len(resp.Grants) != 3 {
+		t.Fatalf("expected 3 grants, got %d: %+v", len(resp.Grants), resp.Grants)
+	}
+	var foundCollaboratorGrant bool
+	for _, g := range resp.Grants {
+		if g.Subject == collaborator && g.Action == ActionRead {
+			foundCollaboratorGrant = true
+			if g.Scope != "read" {
+				t.Fatalf("expected scope %q, got %q", "read", g.Scope)
+			}
+			// The real, load-bearing plumbing assertion: GrantedAtUnix must
+			// be non-zero and must match what memPermissions actually
+			// recorded for this exact grant — proving the value traced
+			// through PermissionsClient.ListGrantsForResource into
+			// AccessGrant, not merely defaulted to zero.
+			if g.GrantedAtUnix == 0 {
+				t.Fatalf("expected non-zero GrantedAtUnix, got 0 — the GrantedAtUnix plumbing gap is not closed")
+			}
+			want, ok := perms.grants[grantKey{collaborator, ActionRead, resourceTypeFileObject, fo.FileObjectID}]
+			if !ok {
+				t.Fatalf("setup invariant broken: expected an active grant in the fake")
+			}
+			if g.GrantedAtUnix != want.grantedAtUnix {
+				t.Fatalf("GrantedAtUnix = %d, want %d (the fake's own recorded value)", g.GrantedAtUnix, want.grantedAtUnix)
+			}
+		}
+	}
+	if !foundCollaboratorGrant {
+		t.Fatalf("expected collaborator's mirrored read grant to be present, got %+v", resp.Grants)
+	}
+}
+
+// TestListFileAccess_NonOwnerCollaboratorRejected proves the owner-only
+// design choice explicitly: a subject who genuinely holds fileobjects.write
+// (and could therefore edit the file's content) is still denied — seeing
+// the full grant list is reasoned in the charter as more sensitive than
+// write access itself (Art. 7 least privilege), so it stays owner-only.
+func TestListFileAccess_NonOwnerCollaboratorRejected(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	if _, err := svc.SetFilePermissions(SetFilePermissionsRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: owner, Grant: true,
+		Subject: collaborator, Action: ActionWrite, Scope: "write",
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	_, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: collaborator})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied for a non-owner write-collaborator, got %v", err)
+	}
+}
+
+// TestListFileAccess_EnumerationOracleClosure is the required,
+// merge-gate-critical proof (charter §3, Security Steward gate finding) that
+// a nonexistent file_object_id and an existing-but-not-owned file_object_id
+// are byte-for-byte indistinguishable from the response alone: same error
+// (via errors.Is), and identical audit event shape (same action, same
+// resource type/ID pattern differing only by the actual file_object_id each
+// case names — never a distinguishing detail like "not found" vs "not
+// owned").
+func TestListFileAccess_EnumerationOracleClosure(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	nonexistentID := "file-object-does-not-exist-at-all"
+
+	// Case 1: existing file, but requesting_subject is not its owner.
+	respA, errA := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: stranger})
+	callA, okA := audit.lastCall()
+
+	// Case 2: file_object_id doesn't exist at all.
+	respB, errB := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: nonexistentID, RequestingSubject: stranger})
+	callB, okB := audit.lastCall()
+
+	if !errors.Is(errA, ErrPermissionDenied) || !errors.Is(errB, ErrPermissionDenied) {
+		t.Fatalf("expected both cases to return ErrPermissionDenied, got errA=%v errB=%v", errA, errB)
+	}
+	// Byte-for-byte identical error text (what an HTTP error body would
+	// carry) — asserted directly, not just errors.Is, since errors.Is alone
+	// would not catch two DIFFERENT wrapped messages that both happen to
+	// wrap the same sentinel.
+	if errA.Error() != errB.Error() {
+		t.Fatalf("expected identical error text for both cases, got %q vs %q", errA.Error(), errB.Error())
+	}
+	if len(respA.Grants) != 0 || len(respB.Grants) != 0 {
+		t.Fatalf("expected no grants returned in either rejection case, got %+v / %+v", respA.Grants, respB.Grants)
+	}
+
+	if !okA || !okB {
+		t.Fatalf("expected both rejections to be audited, got okA=%v okB=%v", okA, okB)
+	}
+	if callA.action != accessListDeniedAction || callB.action != accessListDeniedAction {
+		t.Fatalf("expected both audit actions to be %q, got %q / %q", accessListDeniedAction, callA.action, callB.action)
+	}
+	if callA.resource.ResourceType != resourceTypeFileObject || callB.resource.ResourceType != resourceTypeFileObject {
+		t.Fatalf("expected both audit resource types to be %q, got %q / %q", resourceTypeFileObject, callA.resource.ResourceType, callB.resource.ResourceType)
+	}
+	if callA.ruleReference != callB.ruleReference {
+		t.Fatalf("expected identical rule_reference for both cases, got %q vs %q", callA.ruleReference, callB.ruleReference)
+	}
+	if callA.actor != stranger || callB.actor != stranger {
+		t.Fatalf("expected both audit actors to be the verified caller (%q), got %q / %q", stranger, callA.actor, callB.actor)
+	}
+}
+
+// TestListFileAccess_DeniedOwnerCheckIsAudited proves the Art. 5 obligation
+// (§4, named explicitly for ListFileAccess) directly: any rejection of the
+// service-level owner-resolution check emits accessListDeniedAction, actor
+// the caller who attempted it, resource ("file_object", file_object_id).
+func TestListFileAccess_DeniedOwnerCheckIsAudited(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+
+	_, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: stranger})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied, got %v", err)
+	}
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != accessListDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", accessListDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the rejected caller (%q), got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != resourceTypeFileObject || call.resource.ResourceID != fo.FileObjectID {
+		t.Fatalf("expected audit resource (%q, %q), got %+v", resourceTypeFileObject, fo.FileObjectID, call.resource)
+	}
+}
+
+// TestListFileAccess_EmptyFieldsRejected covers ordinary required-field
+// validation, matching this package's other RPCs' precedent — orthogonal to
+// the enumeration-oracle requirement above (empty file_object_id is never a
+// legitimate ID to probe).
+func TestListFileAccess_EmptyFieldsRejected(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	if _, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: "", RequestingSubject: owner}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty file_object_id, got %v", err)
+	}
+	if _, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: "some-id", RequestingSubject: ""}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty requesting_subject, got %v", err)
+	}
+}
+
+// TestListFileAccess_NoOwnerRequestField is a structural, reflect-based
+// proof of the charter's required, permanent property (Security Steward gate
+// finding): ListFileAccessRequest must never gain an Owner field. A future
+// edit that adds one "for symmetry" with ListFileObjectsRequest would reopen
+// the exact self-asserted-owner bypass ListFileObjects was originally vetoed
+// for.
+func TestListFileAccess_NoOwnerRequestField(t *testing.T) {
+	rv := reflect.TypeOf(ListFileAccessRequest{})
+	for i := 0; i < rv.NumField(); i++ {
+		if strings.EqualFold(rv.Field(i).Name, "Owner") {
+			t.Fatalf("ListFileAccessRequest must never have an Owner field — found %q", rv.Field(i).Name)
+		}
+	}
+}
+
+// TestListFileAccess_ResourceTypeAlwaysFileObject proves the resource-type
+// invariant (charter §3): ListFileAccess only ever calls
+// PermissionsClient.ListGrantsForResource with the literal "file_object"
+// resource type, regardless of grants that exist on OTHER resource types
+// for the exact same resource ID string (e.g. a same-named "blob" resource)
+// — it must never become a back-door way to query Permissions' "blob"
+// namespace.
+func TestListFileAccess_ResourceTypeAlwaysFileObject(t *testing.T) {
+	svc, _, perms, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	versions := storeVersionsFor(t, svc, fo.FileObjectID)
+	blobRef := versions[0].BlobRef
+
+	// A real "blob"-namespaced grant exists (established by CreateFileObject
+	// itself) for this file's own blob_ref — confirm ListFileAccess's result
+	// contains nothing from that namespace.
+	if !perms.hasActiveGrant(owner, storageRetrieveBlobAction, resourceTypeBlob, blobRef) {
+		t.Fatalf("setup invariant broken: expected owner to hold a blob-level grant")
+	}
+
+	resp, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileAccess: %v", err)
+	}
+	for _, g := range resp.Grants {
+		if g.Action == storageRetrieveBlobAction {
+			t.Fatalf("ListFileAccess must never surface a %q-namespaced grant, got %+v", resourceTypeBlob, g)
+		}
+	}
+}
+
+// TestListFileAccess_ResponseNeverContainsBlobRef is charter §6 point 8's
+// established paranoia, applied to this new RPC (charter §3 explicitly
+// requires this test even though the leak is impossible by construction —
+// AccessGrant has no field that could carry a blob_ref, and the call is
+// always scoped to resource_type "file_object"). Reflects over AccessGrant
+// structurally, matching TestListFileObjects_ResponseNeverContainsBlobRef's
+// own precedent exactly.
+func TestListFileAccess_ResponseNeverContainsBlobRef(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	versions := storeVersionsFor(t, svc, fo.FileObjectID)
+	if len(versions) != 1 || versions[0].BlobRef == "" {
+		t.Fatalf("setup failed: expected exactly one version with a blob_ref, got %+v", versions)
+	}
+	blobRef := versions[0].BlobRef
+
+	resp, err := svc.ListFileAccess(ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner})
+	if err != nil {
+		t.Fatalf("ListFileAccess: %v", err)
+	}
+	if len(resp.Grants) == 0 {
+		t.Fatalf("expected at least the owner's own bootstrap grants, got none")
+	}
+	for _, g := range resp.Grants {
+		rv := reflect.ValueOf(g)
+		for i := 0; i < rv.NumField(); i++ {
+			fieldName := rv.Type().Field(i).Name
+			if strings.EqualFold(fieldName, "BlobRef") {
+				t.Fatalf("AccessGrant must never have a BlobRef field, found %q", fieldName)
+			}
+			if s, ok := rv.Field(i).Interface().(string); ok && s == blobRef {
+				t.Fatalf("field %q unexpectedly equals a real blob_ref (%q) — leak", fieldName, blobRef)
+			}
+		}
 	}
 }

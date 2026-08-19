@@ -236,7 +236,18 @@ func (a fileobjectsPermissionsClientAdapter) ListGrantsForResource(resourceType,
 	}
 	out := make([]fileobjects.PermissionGrant, 0, len(resp.Grants))
 	for _, g := range resp.Grants {
-		out = append(out, fileobjects.PermissionGrant{Subject: g.Subject, Action: g.Action, Scope: g.Scope})
+		// GrantedAtUnix is carried through as of the ListFileAccess
+		// amendment (docs/DECISION_LOG.md, 2026-08-18) — previously dropped
+		// here, a plumbing gap Security Steward named explicitly as
+		// required work at the charter gate. CreateVersion's/
+		// SetFilePermissions' own mirroring loops (service.go) ignore this
+		// field; only ListFileAccess's response projection reads it.
+		out = append(out, fileobjects.PermissionGrant{
+			Subject:       g.Subject,
+			Action:        g.Action,
+			Scope:         g.Scope,
+			GrantedAtUnix: g.GrantedAtUnix,
+		})
 	}
 	return out, nil
 }

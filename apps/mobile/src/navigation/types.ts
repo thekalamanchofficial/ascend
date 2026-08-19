@@ -13,6 +13,46 @@ export type RootStackParamList = {
     sessionToken: string;
     displayName: string;
   };
+  Files: {
+    identityRef: string;
+    sessionToken: string;
+    displayName: string;
+  };
+  FileDetail: {
+    identityRef: string;
+    sessionToken: string;
+    fileObjectId: string;
+    /**
+     * Best-effort display hint carried over from wherever this screen was
+     * reached (FilesListScreen's own ListFileObjects result, which does
+     * carry `owner`) — GetFileMetadata's frozen response shape (charter §3)
+     * has no `owner` field, so a file reached via OpenSharedFileScreen's
+     * manual-ID entry has no reliable way to learn it. Never used for any
+     * access-control decision (the server is the sole authority on that,
+     * per every RPC's own CheckPermission/caller-mismatch checks) — display
+     * only.
+     */
+    knownOwner?: string;
+  };
+  ShareFile: {
+    identityRef: string;
+    sessionToken: string;
+    fileObjectId: string;
+  };
+  OpenSharedFile: {
+    identityRef: string;
+    sessionToken: string;
+  };
+  Access: {
+    identityRef: string;
+    sessionToken: string;
+    displayName: string;
+  };
+  Activity: {
+    identityRef: string;
+    sessionToken: string;
+    displayName: string;
+  };
 };
 
 /**

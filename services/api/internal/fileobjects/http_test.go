@@ -3,6 +3,7 @@ package fileobjects
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -435,8 +436,247 @@ func TestHTTP_DeleteFileObject_CallerMatchSucceeds(t *testing.T) {
 	}
 }
 
+// --- ListFileObjects ---
+
+// TestHTTP_ListFileObjects_CallerMismatchRejectedDespiteServiceFieldsMatching
+// is the real, load-bearing proof of the Security Steward veto fix
+// (docs/DECISION_LOG.md, 2026-08-18, "ListFileObjects: Security Steward
+// veto and fix"): a request whose Owner and RequestingSubject fields agree
+// with EACH OTHER (which is all the original, vetoed charter draft would
+// have checked) must still be rejected when the verified network caller is
+// someone else entirely — proving the HTTP-level check is real and not
+// redundant with the service-level one. Uses the real httptest handler, not
+// the service layer in isolation, matching this file's own precedent for
+// its other ten routes.
+func TestHTTP_ListFileObjects_CallerMismatchRejectedDespiteServiceFieldsMatching(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// Verified caller is mallory (stranger), but the request body claims
+	// owner=requesting_subject=alice (owner) — internally self-consistent,
+	// exactly what the original vetoed draft would have let through.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", stranger, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for caller/requesting_subject mismatch even though owner==requesting_subject, got %d", resp.StatusCode)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+
+	// This rejection must be audited too (charter §3's denial-auditing
+	// requirement, broadened to cover the HTTP-level check as well as the
+	// service-level one) — actor is the VERIFIED caller (mallory), never the
+	// unverified request body's requesting_subject (alice), resource is
+	// ("identity", owner), never a file_object_id.
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the HTTP-level rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != listDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", listDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the verified caller (%q), got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("expected audit resource (\"identity\", %q), got %+v", owner, call.resource)
+	}
+}
+
+func TestHTTP_ListFileObjects_CallerMatchSucceeds(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo1 := createTestFileObject(t, svc, owner, []byte("one"))
+	fo2 := createTestFileObject(t, svc, owner, []byte("two"))
+	_ = createTestFileObject(t, svc, stranger, []byte("not-mine"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", owner, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when requesting_subject matches caller, got %d", resp.StatusCode)
+	}
+	var out ListFileObjectsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(out.FileObjects) != 2 {
+		t.Fatalf("expected exactly owner's 2 file objects, got %d: %+v", len(out.FileObjects), out.FileObjects)
+	}
+	got := map[string]bool{}
+	for _, fo := range out.FileObjects {
+		got[fo.FileObjectID] = true
+	}
+	if !got[fo1.FileObjectID] || !got[fo2.FileObjectID] {
+		t.Fatalf("expected both of owner's file objects present, got %+v", out.FileObjects)
+	}
+}
+
+// TestHTTP_ListFileObjects_OwnerMismatchStillRejectedByServiceLayer proves
+// the service-level check (Service.ListFileObjects) still holds even when
+// the HTTP-level check alone would have let a request through: caller and
+// requesting_subject agree (so the HTTP-level check passes), but Owner names
+// someone else — this must still be rejected, by the service layer's own
+// requesting_subject == owner check, and audited.
+func TestHTTP_ListFileObjects_OwnerMismatchStillRejectedByServiceLayer(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	_ = createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// Verified caller is mallory, and the request truthfully names mallory
+	// as requesting_subject (passes the HTTP-level check) — but claims
+	// owner=alice, attempting to enumerate alice's inventory.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/list", stranger, ListFileObjectsRequest{
+		Owner: owner, RequestingSubject: stranger,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for owner != requesting_subject, got %d", resp.StatusCode)
+	}
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the service-level rejection to be audited")
+	}
+	if call.action != listDeniedAction || call.actor != stranger || call.resource.ResourceType != "identity" || call.resource.ResourceID != owner {
+		t.Fatalf("unexpected audit call: %+v", call)
+	}
+}
+
+// --- ListFileAccess (charter §3, frozen 2026-08-18) ----------------------
+
+func TestHTTP_ListFileAccess_CallerMismatchRejected(t *testing.T) {
+	svc, _, _, audit := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// Verified caller is mallory, but the body claims owner as
+	// requesting_subject — the HTTP-level requesting_subject == caller check
+	// must reject this before Service.ListFileAccess ever runs.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/access/list", stranger, ListFileAccessRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for requesting_subject/caller mismatch, got %d", resp.StatusCode)
+	}
+	call, ok := audit.lastCall()
+	if !ok {
+		t.Fatalf("expected the HTTP-level rejection to be audited, but no audit call was recorded")
+	}
+	if call.action != accessListDeniedAction {
+		t.Fatalf("expected audit action %q, got %q", accessListDeniedAction, call.action)
+	}
+	if call.actor != stranger {
+		t.Fatalf("expected audit actor to be the verified caller (%q), never the request body's claim, got %q", stranger, call.actor)
+	}
+	if call.resource.ResourceType != resourceTypeFileObject || call.resource.ResourceID != fo.FileObjectID {
+		t.Fatalf("expected audit resource (%q, %q), got %+v", resourceTypeFileObject, fo.FileObjectID, call.resource)
+	}
+}
+
+func TestHTTP_ListFileAccess_OwnerCallerMatchSucceeds(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/access/list", owner, ListFileAccessRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: owner,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for the owner, got %d", resp.StatusCode)
+	}
+	var out ListFileAccessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(out.Grants) == 0 {
+		t.Fatalf("expected at least the owner's own bootstrap grants, got none")
+	}
+}
+
+func TestHTTP_ListFileAccess_NonOwnerCallerRejected(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+
+	// A genuinely verified, self-consistent request — collaborator really is
+	// making this call as themselves — but collaborator is not the file's
+	// owner, so the service-level check must still reject it.
+	resp := doJSON(t, http.MethodPost, ts.URL+"/file-objects/access/list", collaborator, ListFileAccessRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: collaborator,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for a genuinely-verified non-owner caller, got %d", resp.StatusCode)
+	}
+}
+
+// TestHTTP_ListFileAccess_EnumerationOracleClosure is THE merge-gate-critical
+// test Security Steward will personally re-verify at implementation review
+// (docs/DECISION_LOG.md, "File Objects contract amendment: ListFileAccess,
+// round 2": "Will re-verify the enumeration-oracle requirement again at the
+// implementation merge gate via direct code read plus live-server
+// reproduction"). Proves, over the real HTTP handler (not the service layer
+// in isolation), that a nonexistent file_object_id and an
+// existing-but-not-owned one produce a BYTE-FOR-BYTE identical HTTP
+// response — same status code, same exact response body bytes — so no
+// authenticated caller can distinguish "this file doesn't exist anywhere on
+// the platform" from "this file exists but isn't mine" by observing the
+// response alone.
+func TestHTTP_ListFileAccess_EnumerationOracleClosure(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	fo := createTestFileObject(t, svc, owner, []byte("v1"))
+	ts := newHTTPTestServer(svc)
+	defer ts.Close()
+	nonexistentID := "file-object-does-not-exist-at-all"
+
+	// Case 1: existing file, stranger is not its owner.
+	respA := doJSON(t, http.MethodPost, ts.URL+"/file-objects/access/list", stranger, ListFileAccessRequest{
+		FileObjectID: fo.FileObjectID, RequestingSubject: stranger,
+	})
+	defer respA.Body.Close()
+	bodyA, err := io.ReadAll(respA.Body)
+	if err != nil {
+		t.Fatalf("read body A: %v", err)
+	}
+
+	// Case 2: file_object_id doesn't exist at all.
+	respB := doJSON(t, http.MethodPost, ts.URL+"/file-objects/access/list", stranger, ListFileAccessRequest{
+		FileObjectID: nonexistentID, RequestingSubject: stranger,
+	})
+	defer respB.Body.Close()
+	bodyB, err := io.ReadAll(respB.Body)
+	if err != nil {
+		t.Fatalf("read body B: %v", err)
+	}
+
+	if respA.StatusCode != respB.StatusCode {
+		t.Fatalf("expected identical HTTP status for both cases, got %d (not-owned) vs %d (nonexistent)", respA.StatusCode, respB.StatusCode)
+	}
+	if respA.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for both cases, got %d", respA.StatusCode)
+	}
+	if !bytes.Equal(bodyA, bodyB) {
+		t.Fatalf("expected byte-for-byte identical response bodies, got %q (not-owned) vs %q (nonexistent) — this is a real enumeration oracle", bodyA, bodyB)
+	}
+}
+
 // --- Missing caller header (401, distinct from a mismatch's 403), across
-// all ten routes ---
+// all eleven routes ---
 
 func TestHTTP_MissingCallerHeaderRejected(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
@@ -460,6 +700,8 @@ func TestHTTP_MissingCallerHeaderRejected(t *testing.T) {
 		{"set_file_metadata", "/file-objects/metadata/set", SetFileMetadataRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner, Name: &newName}},
 		{"export_file", "/file-objects/export", ExportFileRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}},
 		{"delete_file_object", "/file-objects/delete", DeleteFileObjectRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}},
+		{"list_file_objects", "/file-objects/list", ListFileObjectsRequest{Owner: owner, RequestingSubject: owner}},
+		{"list_file_access", "/file-objects/access/list", ListFileAccessRequest{FileObjectID: fo.FileObjectID, RequestingSubject: owner}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

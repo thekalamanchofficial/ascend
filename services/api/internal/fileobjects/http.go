@@ -61,6 +61,8 @@ func Mount(r chi.Router, svc *Service) {
 		r.Post("/metadata/set", handleSetFileMetadata(svc))
 		r.Post("/export", handleExportFile(svc))
 		r.Post("/delete", handleDeleteFileObject(svc))
+		r.Post("/list", handleListFileObjects(svc))
+		r.Post("/access/list", handleListFileAccess(svc))
 	})
 }
 
@@ -313,6 +315,92 @@ func handleExportFile(svc *Service) http.HandlerFunc {
 			return
 		}
 		resp, err := svc.ExportFile(req)
+		if err != nil {
+			writeError(w, statusFor(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// handleListFileObjects is the load-bearing fix from the Security Steward
+// veto (docs/DECISION_LOG.md, 2026-08-18, "ListFileObjects: Security
+// Steward veto and fix"): the HTTP-level requesting_subject == caller check
+// below is REQUIRED in addition to (never instead of)
+// Service.ListFileObjects' own service-level requesting_subject == owner
+// check — the charter's first draft specified only the latter, which alone
+// is a complete authorization bypass (any caller could send
+// owner=requesting_subject=<victim> and receive the victim's entire file
+// inventory). Both checks are required and neither is redundant: this one
+// binds requesting_subject to the actually-verified network caller (never a
+// client-supplied value); the service-level one then binds owner to that
+// same, now-verified requesting_subject.
+//
+// A rejection here is audited exactly like a service-level rejection
+// (charter §3's denial-auditing requirement, broadened to cover BOTH
+// rejection reasons) — actor is the verified caller (never the
+// unverified/attacker-controlled req.RequestingSubject), resource is
+// ("identity", req.Owner), naming whose inventory was targeted.
+func handleListFileObjects(svc *Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caller, ok := requireCaller(w, r)
+		if !ok {
+			return
+		}
+		var req ListFileObjectsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.RequestingSubject != caller {
+			svc.auditListDenied(caller, req.Owner)
+			writeError(w, http.StatusForbidden, ErrCallerMismatch)
+			return
+		}
+		resp, err := svc.ListFileObjects(req)
+		if err != nil {
+			writeError(w, statusFor(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// handleListFileAccess mirrors handleListFileObjects' HTTP-level structure
+// exactly (docs/DECISION_LOG.md, 2026-08-18, "File Objects contract
+// amendment: ListFileAccess" — its closest precedent, per the charter's own
+// framing of the two bullets as siblings). The HTTP-level
+// requesting_subject == caller check below runs BEFORE
+// Service.ListFileAccess (and its own service-level owner-resolution check)
+// ever runs — same two-layer discipline as every other RPC in this package.
+//
+// Unlike handleListFileObjects, a caller mismatch here uses ErrCallerMismatch
+// (the same sentinel every other pre-existing handler in this file uses),
+// not ErrPermissionDenied — this rejection reason (unverified requesting
+// caller) is NOT the one the enumeration-oracle closure requirement governs;
+// that requirement is specifically about Service.ListFileAccess's own
+// nonexistent-vs-not-owned indistinguishability (see service.go), which
+// still holds once this check passes and control reaches the service layer.
+// Both rejection reasons are audited via the same auditAccessListDenied call
+// site, actor always the verified caller (never the unverified
+// req.RequestingSubject from the request body).
+func handleListFileAccess(svc *Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caller, ok := requireCaller(w, r)
+		if !ok {
+			return
+		}
+		var req ListFileAccessRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.RequestingSubject != caller {
+			svc.auditAccessListDenied(caller, req.FileObjectID)
+			writeError(w, http.StatusForbidden, ErrCallerMismatch)
+			return
+		}
+		resp, err := svc.ListFileAccess(req)
 		if err != nil {
 			writeError(w, statusFor(err), err)
 			return

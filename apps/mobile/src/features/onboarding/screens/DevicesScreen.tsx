@@ -16,6 +16,7 @@ import type { RootStackParamList, NativeStackNavigationProp } from "../../../nav
 import * as identity from "../../../capabilities/identity";
 import * as sessionauth from "../../../capabilities/sessionauth";
 import { removeDevice, signOutEverywhere } from "../onboarding";
+import { saveAndShareExport } from "../../../lib/export";
 import type { Device } from "../../../capabilities/identity";
 import type { SessionSummary } from "../../../capabilities/sessionauth";
 
@@ -35,7 +36,11 @@ export function DevicesScreen() {
   const [sessions, setSessions] = React.useState<SessionSummary[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
-  const [exportText, setExportText] = React.useState<{ title: string; text: string } | null>(null);
+  // Unsaved-fallback text (only ever populated if the OS share sheet is
+  // genuinely unavailable — see saveAndShareExport) and a brief status
+  // message for the normal, successful-save case.
+  const [exportFallback, setExportFallback] = React.useState<{ title: string; text: string } | null>(null);
+  const [exportStatus, setExportStatus] = React.useState<string | null>(null);
   const [busyAction, setBusyAction] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
@@ -95,9 +100,18 @@ export function DevicesScreen() {
 
   async function handleExportIdentity() {
     setBusyAction("exportIdentity");
+    setExportFallback(null);
+    setExportStatus(null);
     try {
       const resp = await identity.exportIdentity({ identityRef }, sessionToken);
-      setExportText({ title: `Identity export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+      const text = new TextDecoder().decode(resp.exportBlob);
+      const filename = `ascend-identity-export-${identityRef}.json`;
+      const result = await saveAndShareExport(filename, text, "Save your identity export");
+      if (result.shared) {
+        setExportStatus(`Identity export (${resp.formatVersion}) saved as ${filename}.`);
+      } else {
+        setExportFallback({ title: `Identity export (${resp.formatVersion})`, text: result.text });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -107,9 +121,18 @@ export function DevicesScreen() {
 
   async function handleExportSessions() {
     setBusyAction("exportSessions");
+    setExportFallback(null);
+    setExportStatus(null);
     try {
       const resp = await sessionauth.exportSessions(sessionToken);
-      setExportText({ title: `Sessions export (${resp.formatVersion})`, text: new TextDecoder().decode(resp.exportBlob) });
+      const text = new TextDecoder().decode(resp.exportBlob);
+      const filename = `ascend-sessions-export-${identityRef}.json`;
+      const result = await saveAndShareExport(filename, text, "Save your sessions export");
+      if (result.shared) {
+        setExportStatus(`Sessions export (${resp.formatVersion}) saved as ${filename}.`);
+      } else {
+        setExportFallback({ title: `Sessions export (${resp.formatVersion})`, text: result.text });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -143,6 +166,27 @@ export function DevicesScreen() {
     <ScrollView contentContainerStyle={{ padding: 24, gap: 16 }}>
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Devices</Text>
       <Text>{displayName}</Text>
+
+      <Pressable
+        onPress={() => navigation.navigate("Files", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>Files</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => navigation.navigate("Access", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>What I can access</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => navigation.navigate("Activity", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>Activity</Text>
+      </Pressable>
 
       {loading ? <ActivityIndicator /> : null}
       {error ? <Text style={{ color: "#b00020" }}>{error}</Text> : null}
@@ -200,13 +244,23 @@ export function DevicesScreen() {
         </Pressable>
       </View>
 
-      {exportText ? (
+      {exportStatus ? (
         <View style={{ borderWidth: 1, borderColor: "#333", borderRadius: 8, padding: 12, gap: 8 }}>
-          <Text style={{ fontWeight: "600" }}>{exportText.title}</Text>
+          <Text>{exportStatus}</Text>
+          <Pressable onPress={() => setExportStatus(null)}>
+            <Text style={{ textDecorationLine: "underline" }}>Close</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {exportFallback ? (
+        <View style={{ borderWidth: 1, borderColor: "#333", borderRadius: 8, padding: 12, gap: 8 }}>
+          <Text style={{ fontWeight: "600" }}>{exportFallback.title}</Text>
+          <Text>Saving/sharing isn't available on this device — here's the export text to copy manually.</Text>
           <Text selectable style={{ fontFamily: "monospace", fontSize: 12 }}>
-            {exportText.text}
+            {exportFallback.text}
           </Text>
-          <Pressable onPress={() => setExportText(null)}>
+          <Pressable onPress={() => setExportFallback(null)}>
             <Text style={{ textDecorationLine: "underline" }}>Close</Text>
           </Pressable>
         </View>

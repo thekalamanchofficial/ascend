@@ -37,4 +37,4 @@ jobs:
       - name: Check for breaking changes against main
         if: github.event_name == 'pull_request'
         working-directory: packages/contracts
-        run: buf breaking --against '.git#branch=main'
+        run: buf breaking --against '../../.git#ref=origin/main,subdir=packages/contracts'
