@@ -43,6 +43,16 @@ export type RootStackParamList = {
     identityRef: string;
     sessionToken: string;
   };
+  Access: {
+    identityRef: string;
+    sessionToken: string;
+    displayName: string;
+  };
+  Activity: {
+    identityRef: string;
+    sessionToken: string;
+    displayName: string;
+  };
 };
 
 /**

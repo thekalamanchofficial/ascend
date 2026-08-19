@@ -48,6 +48,10 @@ import type {
   ExportFileResponse,
   DeleteFileObjectRequest,
   DeleteFileObjectResponse,
+  ListFileAccessRequest,
+  ListFileAccessResponse,
+  AccessGrant,
+  FileObjectsPermissionAction,
 } from "./types";
 
 export * from "./types";
@@ -115,6 +119,22 @@ function fileEventFromWire(w: WireFileEvent): FileEvent {
   };
 }
 
+interface WireAccessGrant {
+  Subject: string;
+  Action: FileObjectsPermissionAction;
+  Scope: string;
+  GrantedAtUnix: number;
+}
+
+function accessGrantFromWire(w: WireAccessGrant): AccessGrant {
+  return {
+    subject: w.Subject,
+    action: w.Action,
+    scope: w.Scope,
+    grantedAtUnix: w.GrantedAtUnix,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // CreateFileObject — establishes identity, owner, and version 1 in one
 // call. `owner` and `requestingSubject` must both equal the caller's own
@@ -164,6 +184,32 @@ export async function listFileObjects(
   });
 
   return { fileObjects: resp.FileObjects.map(fileObjectFromWire) };
+}
+
+// ---------------------------------------------------------------------------
+// ListFileAccess — "who has access to this file" (charter §3, frozen
+// 2026-08-18). Owner-only, at BOTH layers the server enforces
+// (HTTP-level requestingSubject==the verified bearer-token caller,
+// service-level requestingSubject==the file's real owner via a server-side
+// lookup — this module never supplies an owner). A non-owner caller
+// (including a genuine write-collaborator) receives a 403 ApiError; per the
+// server's enumeration-oracle closure (charter §3), that 403 is
+// indistinguishable from "this fileObjectId doesn't exist at all" — callers
+// of this function should treat ANY 403 here as "hide the affordance", not
+// as a surfaced error (see FileDetailScreen.tsx's usage). Deliberately not
+// marked ascend:mutates — a read, like listFileObjects/getFileMetadata.
+// ---------------------------------------------------------------------------
+export async function listFileAccess(
+  request: ListFileAccessRequest,
+  sessionToken: string,
+): Promise<ListFileAccessResponse> {
+  const resp = await apiRequest<{ Grants: WireAccessGrant[] | null }>("/file-objects/access/list", {
+    method: "POST",
+    bearerToken: sessionToken,
+    body: { FileObjectID: request.fileObjectId, RequestingSubject: request.requestingSubject },
+  });
+
+  return { grants: (resp.Grants ?? []).map(accessGrantFromWire) };
 }
 
 // ---------------------------------------------------------------------------

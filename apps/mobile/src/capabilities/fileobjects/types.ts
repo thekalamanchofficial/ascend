@@ -212,3 +212,41 @@ export interface DeleteFileObjectRequest {
 }
 
 export type DeleteFileObjectResponse = Record<string, never>;
+
+/**
+ * "Who has access to this file" (charter §3, frozen 2026-08-18) — owner-only
+ * (Art. 7 least privilege: seeing every other grantee's identity is a more
+ * sensitive disclosure than a single grant, so this stays owner-only even
+ * for a subject who genuinely holds `fileobjects.write`). Deliberately has
+ * NO `owner` field — the server resolves the file's real owner itself via a
+ * server-side lookup, never from anything this module supplies; adding one
+ * "for symmetry" with `ListFileObjectsRequest` would reopen the exact
+ * self-asserted-owner bypass that RPC was originally vetoed for. A
+ * non-owner caller (including a genuine `fileobjects.write` collaborator)
+ * gets a 403 `ApiError` — callers of `listFileAccess` should treat that as
+ * "hide this affordance", not as an error to surface, mirroring how the
+ * server itself makes a nonexistent and an existing-but-not-owned
+ * fileObjectId indistinguishable (charter §3's enumeration-oracle closure).
+ */
+export interface ListFileAccessRequest {
+  fileObjectId: string;
+  requestingSubject: string;
+}
+
+/**
+ * Mirrors fileobjects.AccessGrant — a transient pass-through of
+ * Permissions' own grant fields minus grantor/resource (both always
+ * identical on every row here — the file's owner, and this file). Never
+ * carries anything resembling a blob_ref (impossible by construction on the
+ * server side, charter §3).
+ */
+export interface AccessGrant {
+  subject: string;
+  action: FileObjectsPermissionAction;
+  scope: string;
+  grantedAtUnix: number;
+}
+
+export interface ListFileAccessResponse {
+  grants: AccessGrant[];
+}

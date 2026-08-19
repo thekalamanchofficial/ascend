@@ -91,10 +91,19 @@ type StorageClient interface {
 // package's mirroring logic (charter §6 points 3-4) to walk every
 // currently-active grant on a resource without importing
 // internal/permissions' own Grant type.
+//
+// GrantedAtUnix was added 2026-08-18 alongside ListFileAccess (charter §3)
+// — previously dropped in translation by services/api/wiring.go's
+// fileobjectsPermissionsClientAdapter.ListGrantsForResource, a plumbing gap
+// Security Steward named explicitly at the charter gate as required work,
+// not something to leave unbacked. CreateVersion's/SetFilePermissions'
+// existing mirroring loops (charter §6 points 3-4) ignore this field; only
+// ListFileAccess's response projection (below) reads it.
 type PermissionGrant struct {
-	Subject string
-	Action  string
-	Scope   string
+	Subject       string
+	Action        string
+	Scope         string
+	GrantedAtUnix int64
 }
 
 // PermissionsClient is the local interface this package depends on for
@@ -117,8 +126,12 @@ type PermissionsClient interface {
 	DefinePolicy(resourceType, defaultRules string) error
 	// ListGrantsForResource answers "who currently has active grants on
 	// this resource" — used by CreateVersion's read-mirroring loop
-	// (charter §6 point 3) and SetFilePermissions' version-mirroring loop
-	// (charter §6 point 4), and by DeleteFileObject's grant-cleanup step.
+	// (charter §6 point 3), SetFilePermissions' version-mirroring loop
+	// (charter §6 point 4), DeleteFileObject's grant-cleanup step, and now
+	// ListFileAccess (charter §3, added 2026-08-18), always called with
+	// resourceType hardcoded to the literal resourceTypeFileObject constant
+	// — never a caller-influenced value — per that RPC's resource-type
+	// invariant.
 	ListGrantsForResource(resourceType, resourceID string) ([]PermissionGrant, error)
 }
 
@@ -414,4 +427,42 @@ type ListFileObjectsRequest struct {
 // therefore reopens none of §6 point 8's three closed leak paths").
 type ListFileObjectsResponse struct {
 	FileObjects []FileObject
+}
+
+// ListFileAccessRequest backs the ListFileAccess RPC (charter §3, proposed
+// 2026-08-18, frozen after two guardian gate rounds — see
+// docs/DECISION_LOG.md, "File Objects contract amendment: ListFileAccess,
+// round 1"/"round 2"). Deliberately carries NO Owner field, unlike
+// ListFileObjectsRequest above — this is a required, permanent property of
+// this request shape (Security Steward gate finding): the service-level
+// check resolves the file object's real owner via a server-side lookup of
+// FileObjectRecord.Owner for FileObjectID, never from a caller-supplied
+// value. Adding an Owner field "for symmetry" with ListFileObjects would
+// reopen exactly the self-asserted-owner bypass that RPC was originally
+// vetoed for.
+type ListFileAccessRequest struct {
+	FileObjectID      string
+	RequestingSubject string
+}
+
+// AccessGrant is ListFileAccess's response shape (charter §3): a transient
+// pass-through of Permissions.Grant's already-manifested fields minus
+// Grantor and Resource (both always identical on every row — the file's
+// owner, and this file, respectively — redundant, not withheld for privacy
+// reasons). Never BlobRef — impossible by construction, since
+// Service.ListFileAccess always calls PermissionsClient.ListGrantsForResource
+// with resourceType hardcoded to the literal "file_object" (charter §3's
+// resource-type invariant), which cannot return a "blob"-namespaced grant
+// regardless of what a caller supplies. File Objects stores nothing new to
+// serve this RPC (Art. 8 closure — no new persisted field, no
+// DATA_MANIFEST.md change).
+type AccessGrant struct {
+	Subject       string
+	Action        string
+	Scope         string
+	GrantedAtUnix int64
+}
+
+type ListFileAccessResponse struct {
+	Grants []AccessGrant
 }

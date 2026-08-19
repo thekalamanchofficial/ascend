@@ -62,6 +62,14 @@ the server side; nothing here is new collection.
   charter defines (§6 point 1) — so this module cannot construct a request
   naming any other action string.
 
+- `grantedAtUnix` (received only, via `listFileAccess` — charter §3, added
+  2026-08-18)
+  Purpose: display only — lets the owner-only "who has access" view
+  (`FileDetailScreen.tsx`) show when each grant was made. Never sent by
+  this module (there is no request field for it); always echoed back
+  from the server's own `Permissions.Grant.GrantedAtUnix`, which this
+  module neither generates nor interprets beyond formatting for display.
+
 ## Fields held locally by this module
 
 None. This module is stateless — it shapes a request, calls the real
@@ -94,8 +102,15 @@ display) is owned by the calling screen layer
   comment. The real audit trail is emitted server-side by
   `services/api/internal/fileobjects/service.go` for every mutating RPC
   and for every denied read/list attempt (the shared `checkRead()` /
-  `auditListDenied()` call sites), scoped to the server-verified caller,
-  independent of anything this client module does or fails to do.
+  `auditListDenied()` / `auditAccessListDenied()` call sites), scoped to
+  the server-verified caller, independent of anything this client module
+  does or fails to do. `listFileAccess` is deliberately NOT marked
+  `// ascend:mutates` here (it is a read, like `listFileObjects`/
+  `getFileMetadata`) — a denied call (a non-owner attempting to see a
+  file's grant list) is denied and audited server-side, but this client
+  module never surfaces that denial as an error to the caller (see
+  `FileDetailScreen.tsx`'s hide-on-403 handling) — there is nothing for
+  this stub to log on that path.
 - `logAuditEvent`'s metadata for `setFilePermissions` includes `subject`
   (an identity_ref) — this is the same class of already-opaque,
   non-secret identifier `identityRef`/`deviceId` are treated as elsewhere

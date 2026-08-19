@@ -12,39 +12,13 @@ import * as React from "react";
 import { View, Text, Pressable, ActivityIndicator, ScrollView, Alert } from "react-native";
 import { useNavigation, useRoute, CommonActions } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
-import * as FileSystem from "expo-file-system";
-import * as Sharing from "expo-sharing";
 import type { RootStackParamList, NativeStackNavigationProp } from "../../../navigation/types";
 import * as identity from "../../../capabilities/identity";
 import * as sessionauth from "../../../capabilities/sessionauth";
 import { removeDevice, signOutEverywhere } from "../onboarding";
+import { saveAndShareExport } from "../../../lib/export";
 import type { Device } from "../../../capabilities/identity";
 import type { SessionSummary } from "../../../capabilities/sessionauth";
-
-// Art. 9 (export) means a real, durable, usable artifact — not a screen the
-// user has to copy-paste or screenshot. Writes the export text to a real
-// file in app-private storage, then hands it to the OS share/save sheet
-// (the standard Expo pattern for getting a file OUT of a sandboxed app on
-// Android/iOS — there is no direct "download to Downloads folder" API)
-// so the user picks where it actually lands (Files, Drive, email, etc.).
-// Falls back to returning the text unsaved only if sharing is genuinely
-// unavailable on this device, so the caller can still show something
-// rather than the export silently going nowhere.
-async function saveAndShareExport(
-  filename: string,
-  text: string,
-  dialogTitle: string,
-): Promise<{ shared: true } | { shared: false; text: string }> {
-  const fileUri = `${FileSystem.documentDirectory}${filename}`;
-  await FileSystem.writeAsStringAsync(fileUri, text, { encoding: FileSystem.EncodingType.UTF8 });
-
-  if (!(await Sharing.isAvailableAsync())) {
-    return { shared: false, text };
-  }
-
-  await Sharing.shareAsync(fileUri, { mimeType: "application/json", dialogTitle });
-  return { shared: true };
-}
 
 type DevicesRouteProp = RouteProp<RootStackParamList, "Devices">;
 
@@ -198,6 +172,20 @@ export function DevicesScreen() {
         style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
       >
         <Text>Files</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => navigation.navigate("Access", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>What I can access</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => navigation.navigate("Activity", { identityRef, sessionToken, displayName })}
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>Activity</Text>
       </Pressable>
 
       {loading ? <ActivityIndicator /> : null}

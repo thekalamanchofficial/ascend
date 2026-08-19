@@ -20,7 +20,7 @@
 // deliberately keeps GetFileHistory scoped to File Objects' own emitted
 // events only — this module never reaches into Permissions'/Storage's own
 // audit trails to build this timeline, only the two RPCs the charter names.
-import type { FileEvent, VersionSummary } from "../../capabilities/fileobjects";
+import type { FileEvent, FileObjectsPermissionAction, VersionSummary } from "../../capabilities/fileobjects";
 
 export interface TimelineEntry {
   eventId: string;
@@ -83,6 +83,25 @@ export function describeAction(action: string): string {
       return "Details updated";
     case "fileobjects.delete_file_object":
       return "File deleted";
+    default:
+      return action;
+  }
+}
+
+/**
+ * Human-readable label for one AccessGrant's `action` (charter §3's
+ * ListFileAccess) — the closed, two-value FileObjectsPermissionAction union
+ * (charter §6 point 1), unlike describeAction's open-ended FileEvent.action
+ * above. The `default` case is unreachable given the closed union type; it
+ * exists only so TypeScript's control-flow analysis can see every path
+ * returns a value.
+ */
+export function describePermissionAction(action: FileObjectsPermissionAction): string {
+  switch (action) {
+    case "fileobjects.read":
+      return "Can view";
+    case "fileobjects.write":
+      return "Can edit";
     default:
       return action;
   }

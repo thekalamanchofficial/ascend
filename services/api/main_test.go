@@ -894,6 +894,119 @@ func TestFileObjectsRoutes_GatedAndReachable(t *testing.T) {
 	})
 }
 
+// TestFileObjectsListFileAccess_LiveOwnerOnlyAndEnumerationOracle is the
+// real, live-server proof of ListFileAccess (charter §3, added 2026-08-18) —
+// exercising the full real composition (a real Postgres-backed Permissions
+// instance, not a fake) exactly as Security Steward committed to
+// re-verifying at this capability's implementation merge gate
+// (docs/DECISION_LOG.md, "File Objects contract amendment: ListFileAccess,
+// round 2": "Will re-verify the enumeration-oracle requirement again at the
+// implementation merge gate via direct code read plus live-server
+// reproduction, the same standard applied to ListFileObjects").
+func TestFileObjectsListFileAccess_LiveOwnerOnlyAndEnumerationOracle(t *testing.T) {
+	srv := newTestServer(t)
+	alice := createTestIdentity(t, srv.URL)
+	bob := createTestIdentity(t, srv.URL)
+	mallory := createTestIdentity(t, srv.URL)
+	aliceToken := issueRealSession(t, srv.URL, alice)
+	bobToken := issueRealSession(t, srv.URL, bob)
+	malloryToken := issueRealSession(t, srv.URL, mallory)
+
+	createResp := postWithAuth(t, srv.URL+"/file-objects/", aliceToken, fileobjects.CreateFileObjectRequest{
+		Owner: alice.identityRef, RequestingSubject: alice.identityRef,
+		InitialContent: []byte("live access-list content"), Name: "access.txt", MimeType: "text/plain",
+	})
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("CreateFileObject: expected 201, got %d: %s", createResp.StatusCode, body)
+	}
+	var created fileobjects.CreateFileObjectResponse
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode CreateFileObject response: %v", err)
+	}
+	fileObjectID := created.FileObject.FileObjectID
+
+	grantResp := postWithAuth(t, srv.URL+"/file-objects/permissions", aliceToken, fileobjects.SetFilePermissionsRequest{
+		FileObjectID: fileObjectID, RequestingSubject: alice.identityRef,
+		Grant: true, Subject: bob.identityRef, Action: fileobjects.ActionRead, Scope: "full",
+	})
+	defer grantResp.Body.Close()
+	if grantResp.StatusCode != http.StatusOK {
+		t.Fatalf("SetFilePermissions (grant read to bob): expected 200, got %d", grantResp.StatusCode)
+	}
+
+	t.Run("Owner_Sees_Real_Grants_With_GrantedAtUnix", func(t *testing.T) {
+		resp := postWithAuth(t, srv.URL+"/file-objects/access/list", aliceToken, fileobjects.ListFileAccessRequest{
+			FileObjectID: fileObjectID, RequestingSubject: alice.identityRef,
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("ListFileAccess as owner: expected 200, got %d: %s", resp.StatusCode, body)
+		}
+		var out fileobjects.ListFileAccessResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode ListFileAccess response: %v", err)
+		}
+		var foundBob bool
+		for _, g := range out.Grants {
+			if g.Subject == bob.identityRef && g.Action == fileobjects.ActionRead {
+				foundBob = true
+				// The real, load-bearing plumbing proof: GrantedAtUnix must
+				// be non-zero when it traces all the way through the real
+				// Postgres-backed permissions.Service.ListGrantsForResource
+				// -> wiring.go's adapter -> AccessGrant, not a fake.
+				if g.GrantedAtUnix == 0 {
+					t.Errorf("expected a non-zero GrantedAtUnix from the real Postgres-backed Permissions instance, got 0 — the GrantedAtUnix plumbing gap is not actually closed live")
+				}
+			}
+		}
+		if !foundBob {
+			t.Fatalf("expected bob's granted read access to appear in the owner's ListFileAccess, got %+v", out.Grants)
+		}
+	})
+
+	t.Run("NonOwnerGrantee_Denied", func(t *testing.T) {
+		// Bob genuinely holds fileobjects.read on this file (granted above)
+		// — real content access — but the owner-only design (charter §3)
+		// still denies him the full grant list.
+		resp := postWithAuth(t, srv.URL+"/file-objects/access/list", bobToken, fileobjects.ListFileAccessRequest{
+			FileObjectID: fileObjectID, RequestingSubject: bob.identityRef,
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("ListFileAccess by a non-owner grantee: expected 403, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("LiveEnumerationOracleClosure_ByteForByteIdentical", func(t *testing.T) {
+		nonexistentID := "file-object-does-not-exist-live-" + fileObjectID
+		respA := postWithAuth(t, srv.URL+"/file-objects/access/list", malloryToken, fileobjects.ListFileAccessRequest{
+			FileObjectID: fileObjectID, RequestingSubject: mallory.identityRef,
+		})
+		defer respA.Body.Close()
+		bodyA, err := io.ReadAll(respA.Body)
+		if err != nil {
+			t.Fatalf("read body A: %v", err)
+		}
+		respB := postWithAuth(t, srv.URL+"/file-objects/access/list", malloryToken, fileobjects.ListFileAccessRequest{
+			FileObjectID: nonexistentID, RequestingSubject: mallory.identityRef,
+		})
+		defer respB.Body.Close()
+		bodyB, err := io.ReadAll(respB.Body)
+		if err != nil {
+			t.Fatalf("read body B: %v", err)
+		}
+		if respA.StatusCode != respB.StatusCode || respA.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected identical 403 for both cases against the REAL Postgres-backed store, got %d (existing-but-not-owned) vs %d (nonexistent)", respA.StatusCode, respB.StatusCode)
+		}
+		if !bytes.Equal(bodyA, bodyB) {
+			t.Fatalf("expected byte-for-byte identical response bodies against the real live server, got %q (existing-but-not-owned) vs %q (nonexistent) — real enumeration oracle", bodyA, bodyB)
+		}
+	})
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

@@ -19,9 +19,10 @@ import { View, Text, TextInput, Pressable, ActivityIndicator, ScrollView, Alert 
 import { useNavigation, useRoute } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
 import type { RootStackParamList, NativeStackNavigationProp } from "../../../navigation/types";
+import { ApiError } from "../../../api/httpClient";
 import * as fileobjects from "../../../capabilities/fileobjects";
-import type { GetFileMetadataResponse } from "../../../capabilities/fileobjects";
-import { buildTimeline, describeAction } from "../vault";
+import type { AccessGrant, FileObjectsPermissionAction, GetFileMetadataResponse } from "../../../capabilities/fileobjects";
+import { buildTimeline, describeAction, describePermissionAction } from "../vault";
 import type { TimelineEntry } from "../vault";
 
 type FileDetailRouteProp = RouteProp<RootStackParamList, "FileDetail">;
@@ -48,6 +49,45 @@ export function FileDetailScreen() {
   const [nameDraft, setNameDraft] = React.useState("");
   const [tagsDraft, setTagsDraft] = React.useState("");
 
+  // "Who has access" (charter §3's ListFileAccess, frozen 2026-08-18) —
+  // owner-only server-side. `accessGrants === null` means either "not
+  // fetched yet" or "the server denied it" — both render as "don't show
+  // this affordance at all", never as an error, per this screen's own
+  // established precedent of never gating a UI element on inferred
+  // ownership (see this file's header comment) and per the task's explicit
+  // instruction to hide-on-403 rather than surface a permission error for a
+  // perfectly ordinary "you don't own this file" case.
+  const [accessGrants, setAccessGrants] = React.useState<AccessGrant[] | null>(null);
+  const [accessExpanded, setAccessExpanded] = React.useState(false);
+
+  const loadAccessGrants = React.useCallback(async () => {
+    // knownOwner is a display-only hint (see navigation/types.ts) carried
+    // over from FilesListScreen's own ListFileObjects result — when it's
+    // present and names someone else, we already know client-side this
+    // call would be denied, so skip the round trip entirely. When it's
+    // absent (a file reached via OpenSharedFileScreen's manual-ID entry,
+    // where ownership is genuinely unknown until the server answers) we
+    // still attempt it and hide gracefully on a 403.
+    if (knownOwner !== undefined && knownOwner !== identityRef) {
+      setAccessGrants(null);
+      return;
+    }
+    try {
+      const resp = await fileobjects.listFileAccess({ fileObjectId, requestingSubject: identityRef }, sessionToken);
+      setAccessGrants(resp.grants);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        setAccessGrants(null); // not the owner — hide the affordance, not an error
+        return;
+      }
+      // An unexpected failure (network, 500, ...) — don't block the rest of
+      // this screen from rendering over a "who has access" hiccup; simply
+      // leave the affordance hidden. Metadata/history errors above already
+      // have their own dedicated error surface.
+      setAccessGrants(null);
+    }
+  }, [fileObjectId, identityRef, sessionToken, knownOwner]);
+
   const load = React.useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -66,7 +106,11 @@ export function FileDetailScreen() {
     } finally {
       setLoading(false);
     }
-  }, [fileObjectId, identityRef, sessionToken]);
+    // Deliberately not awaited into the same try/catch above — a denied
+    // (or failed) access-list fetch must never block metadata/history from
+    // rendering.
+    void loadAccessGrants();
+  }, [fileObjectId, identityRef, sessionToken, loadAccessGrants]);
 
   React.useEffect(() => {
     load();
@@ -125,6 +169,25 @@ export function FileDetailScreen() {
         title: `Export (${resp.formatVersion})`,
         text: new TextDecoder().decode(resp.exportBlob),
       });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  // Revoking is exactly SetFilePermissions(grant=false, ...) — File
+  // Objects' contract already exposes this; no new revoke RPC is invented
+  // here (per the task's explicit instruction).
+  async function handleRevokeAccess(subject: string, action: FileObjectsPermissionAction) {
+    setBusyAction(`revokeAccess:${subject}:${action}`);
+    setError(null);
+    try {
+      await fileobjects.setFilePermissions(
+        { fileObjectId, requestingSubject: identityRef, grant: false, subject, action, scope: "" },
+        sessionToken,
+      );
+      await loadAccessGrants();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -228,6 +291,53 @@ export function FileDetailScreen() {
           </Text>
         </Pressable>
       </View>
+
+      {accessGrants !== null ? (
+        <View style={{ gap: 8 }}>
+          <Pressable onPress={() => setAccessExpanded((v) => !v)}>
+            <Text style={{ fontSize: 16, fontWeight: "600", textDecorationLine: "underline" }}>
+              Who has access ({accessGrants.length}){accessExpanded ? " ▾" : " ▸"}
+            </Text>
+          </Pressable>
+          {accessExpanded ? (
+            <View style={{ gap: 6 }}>
+              {accessGrants.map((g) => {
+                const isOwnerRow = g.subject === identityRef;
+                const key = `${g.subject}:${g.action}`;
+                const revokeKey = `revokeAccess:${g.subject}:${g.action}`;
+                return (
+                  <View
+                    key={key}
+                    style={{
+                      flexDirection: "row",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      borderWidth: 1,
+                      borderColor: "#ddd",
+                      borderRadius: 8,
+                      padding: 10,
+                    }}
+                  >
+                    <View style={{ gap: 2 }}>
+                      <Text style={{ fontWeight: "600" }}>{isOwnerRow ? "You (owner)" : g.subject}</Text>
+                      <Text style={{ color: "#666" }}>
+                        {describePermissionAction(g.action)} · granted {formatUnixSeconds(g.grantedAtUnix)}
+                      </Text>
+                    </View>
+                    {isOwnerRow ? null : (
+                      <Pressable disabled={busyAction === revokeKey} onPress={() => handleRevokeAccess(g.subject, g.action)}>
+                        <Text style={{ color: "#b00020", textDecorationLine: "underline" }}>
+                          {busyAction === revokeKey ? "Revoking…" : "Revoke"}
+                        </Text>
+                      </Pressable>
+                    )}
+                  </View>
+                );
+              })}
+            </View>
+          ) : null}
+        </View>
+      ) : null}
 
       <View style={{ gap: 8 }}>
         <Text style={{ fontSize: 16, fontWeight: "600" }}>History</Text>
