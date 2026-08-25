@@ -12,6 +12,22 @@ export type RootStackParamList = {
     deviceId: string;
     sessionToken: string;
     displayName: string;
+    /**
+     * This process's own registered Cryptography & Keys identity key handle
+     * (purpose "sign:identity") — added for Conversations' mobile client
+     * (conversations.charter.md §2/§5), the first screen flow that genuinely
+     * needs it. Threaded the same way `sessionToken` already is: obtained
+     * once at CreateIdentity/RestoreIdentity time (see
+     * features/onboarding/onboarding.ts's `CreateIdentityResult`/
+     * `OnboardingResult`) and carried forward through every screen that
+     * needs to make a crypto call using this identity's key, starting here.
+     * A `KeyHandle` is process-lifetime-scoped by construction
+     * (crypto/keyRegistry.ts) — this is NOT a value that survives a cold
+     * app restart; see onboarding.ts's own already-disclosed "KNOWN GAP"
+     * comment on persistent login, which this addition does not attempt to
+     * solve (out of scope for Conversations, per this pass's brief).
+     */
+    privateKeyHandle: { handle: string };
   };
   Files: {
     identityRef: string;
@@ -52,6 +68,40 @@ export type RootStackParamList = {
     identityRef: string;
     sessionToken: string;
     displayName: string;
+  };
+  // --- Conversations (conversations.charter.md) ---
+  //
+  // `deviceId`/`privateKeyHandle` are required on every Conversations
+  // screen — session establishment (crypto.deriveSharedSecret/
+  // completeSharedSecret) and the invisible prekey-bundle bootstrap
+  // (crypto.generatePrekeyBundle -> identity.publishPrekeyBundle,
+  // features/conversations/prekeyLifecycle.ts) both need them.
+  Conversations: {
+    identityRef: string;
+    deviceId: string;
+    sessionToken: string;
+    displayName: string;
+    privateKeyHandle: { handle: string };
+  };
+  ConversationThread: {
+    identityRef: string;
+    deviceId: string;
+    sessionToken: string;
+    privateKeyHandle: { handle: string };
+    otherParticipant: string;
+    /**
+     * Omitted for a not-yet-created conversation (reached via
+     * StartConversationScreen) — CreateConversation is called lazily, only
+     * at the moment of actually sending the first message (charter §5),
+     * never merely on opening this screen.
+     */
+    conversationId?: string;
+  };
+  StartConversation: {
+    identityRef: string;
+    deviceId: string;
+    sessionToken: string;
+    privateKeyHandle: { handle: string };
   };
 };
 

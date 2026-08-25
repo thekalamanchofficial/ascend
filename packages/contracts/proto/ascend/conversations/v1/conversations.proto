@@ -1,0 +1,208 @@
+syntax = "proto3";
+
+package ascend.conversations.v1;
+
+option go_package = "github.com/ascend/services/api/gen/go/ascend/conversations/v1;conversationsv1";
+
+// Conversations — durable, participant-scoped message-relay and history
+// primitive for direct (exactly two-participant) communication between two
+// identities. Frozen from docs/capabilities/conversations.charter.md §3,
+// gated 2026-08-19 after two full guardian veto-and-fix rounds (see
+// docs/DECISION_LOG.md).
+//
+// SCOPE (charter §3): direct conversations only in this first freeze.
+// Group conversations are a real, anticipated future extension requiring a
+// different crypto scheme (sender-keys) and are deliberately not attempted
+// here.
+//
+// THE ENCRYPTION BOUNDARY, THE ONE INVARIANT EVERY MESSAGE BELOW MUST
+// PRESERVE (charter §6): this service's backend must be STRUCTURALLY
+// incapable of reading message content, not merely policy-forbidden.
+// `ciphertext` and `session_establishment_payload` are opaque bytes,
+// already produced/encrypted client-side by Cryptography & Keys before any
+// RPC below is ever called. This package has zero dependency, direct or
+// transitive, on any decryption capability — the Go backend implementing
+// this contract must never import Cryptography & Keys or attempt to
+// interpret these fields. Even a fully compromised server yields ciphertext
+// only.
+//
+// CALLER-IDENTITY BINDING (charter §3's blanket requirement, stated once
+// here as it is once in the charter): every RPC below requires HTTP-level
+// binding of its identity-bearing field (creator/sender/requesting_subject)
+// to the network-verified caller identity, checked before any handler
+// logic runs — the same requireVerifiedCaller-shaped middleware every
+// other gated route in this codebase uses. Rejection on mismatch is a 403,
+// audited.
+//
+// ENUMERATION-ORACLE-SAFE DENIAL, required for GetConversation,
+// ListMessages, ExportConversation, and SendMessage (charter §3/§6): a
+// nonexistent conversation_id and an existing-but-not-a-participant
+// conversation_id must produce byte-for-byte identical response
+// status/body and identical audit event shape — the same discipline
+// docs/capabilities/file-objects.charter.md's ListFileAccess amendment
+// established.
+//
+// PERMISSIONS INTEGRATION (charter §3, corrected during the charter gate
+// — see docs/DECISION_LOG.md's round-1 Constitution Warden finding):
+// participant-membership is NOT a decision this service invents. It
+// registers a "conversation" Permissions resource type (single action,
+// "conversations.access") with a deny-by-default policy at construction,
+// and CreateConversation bootstraps both participants' grants via
+// Permissions' own GrantPermission — mirroring File Objects' "file_object"
+// resource-type pattern exactly. Every other RPC's participant check
+// delegates to Permissions.CheckPermission.
+//
+// NO ExportConversation-IS-A-COMPLETE-TRANSCRIPT PROMISE (charter §3): the
+// ratchet's forward-secrecy design means a message's decryption key is not
+// durably retained after use, so ExportConversation returns this
+// capability's own stored bytes, verifiably complete and unaltered — NOT a
+// decryptability guarantee. The recommended, complementary, guaranteed-
+// readable export is a local, on-device bundling of the client's own
+// already-decrypted message store (Cryptography & Keys' SecureLocalStore),
+// which this proto has no RPC for since it is, by design, not a server
+// operation.
+
+service ConversationsService {
+  // Establishes a direct conversation between exactly two identity_refs.
+  // creator must equal the verified caller (closes a real enumeration risk
+  // — see charter §3: without this binding, an unrelated caller could
+  // probe arbitrary (creator, participant) pairs to learn whether two
+  // strangers already have a conversation, given this call's idempotent-
+  // by-pair behavior below). Idempotent by pair: calling this again for a
+  // pair that already has a conversation returns the existing
+  // conversation_id rather than creating a duplicate. Bootstraps both
+  // participants' Permissions access.
+  rpc CreateConversation(CreateConversationRequest) returns (CreateConversationResponse);
+
+  // ciphertext is opaque, already-encrypted bytes — this backend never
+  // decrypts, never attempts to, and structurally cannot.
+  // session_establishment_payload is optional opaque bytes carrying the
+  // sender's X3DH-style handshake contribution (Cryptography & Keys
+  // charter §3), present only on a session-establishing/re-establishing
+  // message; relayed byte-for-byte, never interpreted, the same opacity
+  // discipline File Objects applies to blob_ref. Authorization: (1)
+  // HTTP-level sender == caller; (2) sender must hold the conversation's
+  // Permissions grant (Permissions.CheckPermission) — enumeration-oracle-
+  // safe denial on either failure.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+
+  // Ascending chronological order, cursor-paginated from day one —
+  // deliberately not following the "unbounded, accepted for now"
+  // precedent ListFileObjects/ListDevices/ListActiveSessions/ListVersions
+  // share (charter §3: message volume is a difference in kind, not a
+  // stricter opinion about the same risk those prior charters accepted).
+  // Gated to conversation participants only via Permissions.CheckPermission,
+  // same enumeration-oracle-safe indistinguishability as GetConversation.
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+
+  // Self-only, mirroring ListFileObjects/ListGrantsForSubject's
+  // self-scoped-inventory pattern. Deliberately no message preview/
+  // snippet field — the server never has plaintext to preview; an inbox
+  // preview is necessarily a client-side concern (charter §3). A
+  // conversation_summary with created_at set but no messages yet (a
+  // CreateConversation-succeeded/SendMessage-failed partial-failure gap,
+  // not a normal state) must be omitted from results entirely,
+  // indistinguishable from never having called CreateConversation at all
+  // (charter §3, Experience Guardian gate finding).
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+
+  // Participant-only gated, enumeration-oracle-safe: a conversation ID
+  // guess must not be distinguishable from "you're not in that
+  // conversation."
+  rpc GetConversation(GetConversationRequest) returns (GetConversationResponse);
+
+  // Returns this capability's stored data byte-for-byte as held — every
+  // message's ciphertext/session_establishment_payload/sender/sent_at,
+  // plus conversation metadata — NOT a promise the bundle is decryptable
+  // (see the file-level comment above). Same participant-gated,
+  // enumeration-oracle-safe discipline as ListMessages.
+  rpc ExportConversation(ExportConversationRequest) returns (ExportConversationResponse);
+}
+
+message ConversationMessage {
+  string message_id = 1;
+  string sender = 2;
+  bytes ciphertext = 3;
+  // Opaque; present only on a session-establishing/re-establishing
+  // message. Never interpreted by this service.
+  optional bytes session_establishment_payload = 4;
+  int64 sent_at_unix = 5;
+}
+
+message ConversationSummary {
+  string conversation_id = 1;
+  string other_participant = 2;
+  int64 created_at_unix = 3;
+  // Derived at query time as MAX(sent_at) over the conversation's stored
+  // messages — never a separately persisted/denormalized field (charter
+  // §3, §4 Art. 8).
+  int64 last_message_at_unix = 4;
+}
+
+message CreateConversationRequest {
+  string creator = 1;
+  string participant = 2;
+}
+
+message CreateConversationResponse {
+  string conversation_id = 1;
+  int64 created_at_unix = 2;
+}
+
+message SendMessageRequest {
+  string conversation_id = 1;
+  string sender = 2;
+  bytes ciphertext = 3;
+  optional bytes session_establishment_payload = 4;
+}
+
+message SendMessageResponse {
+  string message_id = 1;
+  int64 sent_at_unix = 2;
+}
+
+message ListMessagesRequest {
+  string conversation_id = 1;
+  string requesting_subject = 2;
+  // Cursor for pagination; omit to start from the most recent page.
+  optional string before_message_id = 3;
+  int32 limit = 4;
+}
+
+message ListMessagesResponse {
+  repeated ConversationMessage messages = 1;
+  bool has_more = 2;
+}
+
+message ListConversationsRequest {
+  string requesting_subject = 1;
+}
+
+message ListConversationsResponse {
+  repeated ConversationSummary conversations = 1;
+}
+
+message GetConversationRequest {
+  string conversation_id = 1;
+  string requesting_subject = 2;
+}
+
+message GetConversationResponse {
+  string conversation_id = 1;
+  repeated string participants = 2;
+  int64 created_at_unix = 3;
+}
+
+message ExportConversationRequest {
+  string conversation_id = 1;
+  string requesting_subject = 2;
+}
+
+message ExportConversationResponse {
+  // This capability's own stored bytes, byte-for-byte — see the file-level
+  // comment on decryptability. Format is an implementation decision for
+  // the capability engineer, must be self-describing (mirrors ExportFile's
+  // "complete artifact" bar).
+  bytes export_blob = 1;
+  string format_version = 2;
+}

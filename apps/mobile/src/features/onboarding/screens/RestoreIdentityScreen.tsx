@@ -8,6 +8,7 @@
 import * as React from "react";
 import { View, Text, TextInput, Pressable, ActivityIndicator, ScrollView } from "react-native";
 import { useNavigation } from "@react-navigation/native";
+import * as Clipboard from "expo-clipboard";
 import type { NativeStackNavigationProp } from "../../../navigation/types";
 import { restoreIdentityFlow } from "../onboarding";
 
@@ -18,6 +19,11 @@ export function RestoreIdentityScreen() {
   const [deviceName, setDeviceName] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  async function handlePastePhrase() {
+    const text = await Clipboard.getStringAsync();
+    if (text) setRecoveryPhrase(text);
+  }
 
   async function handleRestore() {
     setError(null);
@@ -37,6 +43,7 @@ export function RestoreIdentityScreen() {
         deviceId: restored.deviceId,
         sessionToken: restored.sessionToken,
         displayName: restored.displayName,
+        privateKeyHandle: restored.identityPrivateKeyHandle,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -74,6 +81,12 @@ export function RestoreIdentityScreen() {
           placeholder="24-word recovery phrase"
           style={{ borderWidth: 1, borderColor: "#999", borderRadius: 6, padding: 10, minHeight: 80 }}
         />
+        <Pressable
+          onPress={handlePastePhrase}
+          style={{ alignSelf: "flex-start", borderWidth: 1, borderColor: "#999", borderRadius: 6, padding: 8 }}
+        >
+          <Text>Paste from clipboard</Text>
+        </Pressable>
       </View>
 
       <View style={{ gap: 8 }}>

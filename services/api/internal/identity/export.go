@@ -17,6 +17,12 @@ const ExportFormatVersion = "ascend-identity-export-v1"
 // here is a field the user couldn't already see via ResolveIdentity/
 // ListDevices, it is simply packaged as one complete, user-readable
 // document per Art. 9.
+// Device.UnconsumedOneTimePrekeyCount (types.go, added 2026-08-20) is
+// deliberately NOT included here — charter §4's prekey-bundle amendment
+// states explicitly that prekey state (including this derived count) is
+// excluded from ExportIdentity's output: it is ephemeral, auto-
+// regenerating routing infrastructure, not data whose loss would harm a
+// leaving user. Stated in code, not a silent omission.
 type exportedDevice struct {
 	DeviceID     string `json:"deviceId"`
 	Name         string `json:"name"`

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/ascend/services/api/internal/fileobjects"
+	"github.com/ascend/services/api/internal/identity"
 	"github.com/ascend/services/api/internal/platform"
 	"github.com/ascend/services/api/internal/storage"
 )
@@ -1016,6 +1017,305 @@ func mustJSON(t *testing.T, v any) []byte {
 	return b
 }
 
+// bindSecondDevice binds a genuine second device to id (authorized by
+// id's own first-device private key, the already-bound-device path per
+// charter §3/§6), over real HTTP, and returns a testIdentity describing
+// the NEW device — used by the prekey publish/fetch tests below to
+// exercise the device-level (not just identity-level) caller-binding
+// requirement, which needs two distinct devices genuinely bound to the
+// SAME identity.
+func bindSecondDevice(t *testing.T, baseURL string, id testIdentity, deviceName string) testIdentity {
+	t.Helper()
+	newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate second device key: %v", err)
+	}
+
+	// epoch 0: mirrors createTestIdentity's own precedent — every
+	// testIdentity here is freshly created with no prior bind/revoke.
+	var buf bytes.Buffer
+	buf.WriteString("ascend.identity.v1.BindDevice")
+	buf.WriteByte(0)
+	buf.WriteString(id.identityRef)
+	buf.WriteByte(0)
+	buf.WriteString(base64.StdEncoding.EncodeToString(newPub))
+	buf.WriteByte(0)
+	buf.WriteString(deviceName)
+	buf.WriteByte(0)
+	buf.WriteString("0")
+	proof := ed25519.Sign(id.priv, buf.Bytes())
+
+	body, _ := json.Marshal(map[string]any{
+		"devicePublicKey":    base64.StdEncoding.EncodeToString(newPub),
+		"deviceName":         deviceName,
+		"authorizationProof": base64.StdEncoding.EncodeToString(proof),
+	})
+	resp, err := http.Post(baseURL+"/v1/identity/"+id.identityRef+"/devices", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("BindDevice request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("BindDevice: expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+	var out struct {
+		Device struct {
+			DeviceID string `json:"deviceId"`
+		} `json:"device"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode BindDevice response: %v", err)
+	}
+	return testIdentity{identityRef: id.identityRef, deviceID: out.Device.DeviceID, pub: newPub, priv: newPriv}
+}
+
+func testSignedPrekeyForHTTP(prekeyID string) identity.SignedPrekey {
+	return identity.SignedPrekey{
+		PrekeyID:      prekeyID,
+		PublicKey:     []byte{0x01, 0x02, 0x03},
+		Signature:     []byte{0xAA, 0xBB, 0xCC, 0xDD},
+		CreatedAtUnix: 1_700_000_000,
+	}
+}
+
+// testDhKeyMaterialForHTTP returns deterministic, distinguishable
+// identity_dh_public_key/identity_dh_public_key_signature test bytes
+// (key-separation fix, charter §3/§6) — the real HTTP server never
+// verifies these signatures itself (pure storage/relay), so plain tagged
+// bytes are sufficient for these live-HTTP tests, same precedent as
+// testSignedPrekeyForHTTP above.
+func testDhKeyMaterialForHTTP(id string) (identityDhPublicKey, identityDhPublicKeySignature []byte) {
+	return []byte("dh-pub-" + id), []byte("dh-sig-" + id)
+}
+
+// publishPrekeyBundleRequestForHTTP builds a complete, valid
+// PublishPrekeyBundleRequest body (signed prekey plus the required
+// identity_dh_public_key/identity_dh_public_key_signature pair,
+// key-separation fix charter §3) for these live-HTTP tests.
+func publishPrekeyBundleRequestForHTTP(prekeyID string) identity.PublishPrekeyBundleRequest {
+	dhPub, dhSig := testDhKeyMaterialForHTTP(prekeyID)
+	return identity.PublishPrekeyBundleRequest{
+		SignedPrekey:                 testSignedPrekeyForHTTP(prekeyID),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+	}
+}
+
+// TestPublishPrekeyBundle_DeviceBindingEnforced_LiveHTTP is the live proof
+// of charter §6's core requirement, against the real, fully-wired
+// composition root: identity_ref AND device_id must both equal the
+// verified caller's own — not merely identity_ref (see wiring.go's
+// requireCallerMatchesIdentityAndDevice doc comment, and the risk it
+// closes: "any of a multi-device identity's own already-bound devices
+// could publish a bogus bundle for a different device of the same
+// identity").
+func TestPublishPrekeyBundle_DeviceBindingEnforced_LiveHTTP(t *testing.T) {
+	srv := newTestServer(t)
+	alice := createTestIdentity(t, srv.URL)
+	bob := createTestIdentity(t, srv.URL)
+	aliceSecondDevice := bindSecondDevice(t, srv.URL, alice, "Alice's Second Device")
+
+	aliceFirstDeviceToken := issueRealSession(t, srv.URL, alice)
+
+	t.Run("OwnIdentity_OwnDevice_Allowed", func(t *testing.T) {
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+alice.deviceID+"/prekeys",
+			aliceFirstDeviceToken, publishPrekeyBundleRequestForHTTP("spk-own"))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PublishPrekeyBundle for caller's own device: expected 200, got %d: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("OwnIdentity_OtherOwnDevice_Forbidden", func(t *testing.T) {
+		// Alice's genuinely valid session (for her FIRST device) used
+		// against her OWN second device — same identity_ref, wrong
+		// device_id. This is the narrower impersonation risk charter §6
+		// names explicitly, and it is what an identity-only check
+		// (requireCallerMatchesIdentity) would incorrectly allow.
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+aliceSecondDevice.deviceID+"/prekeys",
+			aliceFirstDeviceToken, publishPrekeyBundleRequestForHTTP("spk-other-device"))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PublishPrekeyBundle for a DIFFERENT device of the SAME identity: expected 403, got %d: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("OtherIdentity_Forbidden", func(t *testing.T) {
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+bob.identityRef+"/devices/"+bob.deviceID+"/prekeys",
+			aliceFirstDeviceToken, publishPrekeyBundleRequestForHTTP("spk-other-identity"))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PublishPrekeyBundle for a different identity: expected 403, got %d: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("NoToken_Unauthorized", func(t *testing.T) {
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+alice.deviceID+"/prekeys",
+			"", publishPrekeyBundleRequestForHTTP("spk-no-token"))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("PublishPrekeyBundle with no token: expected 401, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// TestPublishPrekeyBundle_RequiresIdentityDhKeyPair_LiveHTTP is the live,
+// HTTP-level proof of the key-separation fix's request-validation
+// requirement (charter §3, service.go's PublishPrekeyBundle): a bundle
+// missing EITHER identity_dh_public_key OR
+// identity_dh_public_key_signature is rejected with 400, against the
+// real, fully-wired server — this is what makes the corresponding
+// FetchPrekeyBundle fail-closed case (see
+// TestFetchPrekeyBundle_EnumerationOracleClosure_LiveHTTP's own comment)
+// unreachable through the real HTTP surface at all.
+func TestPublishPrekeyBundle_RequiresIdentityDhKeyPair_LiveHTTP(t *testing.T) {
+	srv := newTestServer(t)
+	alice := createTestIdentity(t, srv.URL)
+	aliceToken := issueRealSession(t, srv.URL, alice)
+
+	t.Run("MissingIdentityDhPublicKey_Rejected", func(t *testing.T) {
+		req := publishPrekeyBundleRequestForHTTP("spk-missing-dh-pub")
+		req.IdentityDhPublicKey = nil
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+alice.deviceID+"/prekeys", aliceToken, req)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PublishPrekeyBundle missing identity_dh_public_key: expected 400, got %d: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("MissingIdentityDhPublicKeySignature_Rejected", func(t *testing.T) {
+		req := publishPrekeyBundleRequestForHTTP("spk-missing-dh-sig")
+		req.IdentityDhPublicKeySignature = nil
+		resp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+alice.deviceID+"/prekeys", aliceToken, req)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PublishPrekeyBundle missing identity_dh_public_key_signature: expected 400, got %d: %s", resp.StatusCode, body)
+		}
+	})
+}
+
+// TestFetchPrekeyBundle_OpenToAnyAuthenticatedCaller_LiveHTTP proves
+// FetchPrekeyBundle's deliberate openness (charter §3/§6) against the real
+// composition root: Bob, an entirely different identity from Alice, can
+// fetch ALICE's bundle using BOB's own session token — never gated by
+// requireCallerMatchesIdentity, only by requireVerifiedCaller (any valid
+// session).
+func TestFetchPrekeyBundle_OpenToAnyAuthenticatedCaller_LiveHTTP(t *testing.T) {
+	srv := newTestServer(t)
+	alice := createTestIdentity(t, srv.URL)
+	bob := createTestIdentity(t, srv.URL)
+	aliceToken := issueRealSession(t, srv.URL, alice)
+	bobToken := issueRealSession(t, srv.URL, bob)
+
+	aliceDhPub, aliceDhSig := testDhKeyMaterialForHTTP("spk-alice")
+	publishResp := postWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/devices/"+alice.deviceID+"/prekeys",
+		aliceToken, identity.PublishPrekeyBundleRequest{
+			SignedPrekey:                 testSignedPrekeyForHTTP("spk-alice"),
+			IdentityDhPublicKey:          aliceDhPub,
+			IdentityDhPublicKeySignature: aliceDhSig,
+			OneTimePrekeys:               []identity.OneTimePrekeyPublic{{PrekeyID: "otp-alice-1", PublicKey: []byte{0x09}}},
+		})
+	defer publishResp.Body.Close()
+	if publishResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(publishResp.Body)
+		t.Fatalf("Alice publishing her own bundle: expected 200, got %d: %s", publishResp.StatusCode, body)
+	}
+
+	t.Run("BobCanFetchAlicesBundle", func(t *testing.T) {
+		resp := getWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/prekey-bundle?deviceId="+alice.deviceID, bobToken)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("Bob fetching Alice's bundle: expected 200, got %d: %s", resp.StatusCode, body)
+		}
+		var out identity.FetchPrekeyBundleResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode FetchPrekeyBundle response: %v", err)
+		}
+		if out.Status != identity.PrekeyBundleStatusAvailable {
+			t.Fatalf("expected AVAILABLE, got %v", out.Status)
+		}
+		if out.OneTimePrekey == nil || out.OneTimePrekey.PrekeyID != "otp-alice-1" {
+			t.Fatalf("expected to receive otp-alice-1, got %+v", out.OneTimePrekey)
+		}
+		// key-separation fix (charter §3/§6): identity_dh_public_key is
+		// Alice's DEVICE's stored DH key, NEVER her identity's Ed25519
+		// signing key — verified against the real HTTP/JSON wire bytes,
+		// not just the in-process Service layer.
+		if string(out.IdentityDhPublicKey) != string(aliceDhPub) {
+			t.Fatalf("identity_dh_public_key mismatch: got %q, want %q", out.IdentityDhPublicKey, aliceDhPub)
+		}
+		if string(out.IdentityDhPublicKeySignature) != string(aliceDhSig) {
+			t.Fatalf("identity_dh_public_key_signature mismatch: got %q, want %q", out.IdentityDhPublicKeySignature, aliceDhSig)
+		}
+		if len(out.IdentitySigningPublicKey) == 0 {
+			t.Fatalf("expected a non-empty identity_signing_public_key")
+		}
+		if string(out.IdentitySigningPublicKey) == string(out.IdentityDhPublicKey) {
+			t.Fatalf("identity_signing_public_key and identity_dh_public_key must never be the same bytes")
+		}
+	})
+
+	t.Run("NoToken_Unauthorized", func(t *testing.T) {
+		resp := getWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/prekey-bundle", "")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("FetchPrekeyBundle with no token: expected 401, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// TestFetchPrekeyBundle_EnumerationOracleClosure_LiveHTTP is the live,
+// HTTP-level proof of charter §6's Security Steward gate finding: a
+// device_id that genuinely belongs to the target identity but has never
+// published a bundle must be byte-for-byte indistinguishable from a
+// device_id that does not belong to that identity at all — against the
+// real, fully-wired server, not just the in-process Service layer
+// (service_test.go already covers that; this is the same guarantee
+// re-verified through the real HTTP/JSON encoding path).
+//
+// The key-separation fix's THIRD fail-closed case (a signed prekey
+// published but its identity_dh_public_key/signature pair missing) is NOT
+// exercised here: PublishPrekeyBundle's own request validation (below,
+// TestPublishPrekeyBundle_RequiresIdentityDhKeyPair_LiveHTTP) makes that
+// state unreachable through the real HTTP surface at all — the only way
+// to construct it is by calling the store directly, which
+// service_test.go's TestFetchPrekeyBundle_NeverPublishedAndUnboundDevice_ByteIdenticalResponses
+// already does as a white-box test.
+func TestFetchPrekeyBundle_EnumerationOracleClosure_LiveHTTP(t *testing.T) {
+	srv := newTestServer(t)
+	alice := createTestIdentity(t, srv.URL) // never publishes any bundle
+	bob := createTestIdentity(t, srv.URL)
+	bobToken := issueRealSession(t, srv.URL, bob)
+
+	respA := getWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/prekey-bundle?deviceId="+alice.deviceID, bobToken)
+	defer respA.Body.Close()
+	bodyA, err := io.ReadAll(respA.Body)
+	if err != nil {
+		t.Fatalf("read body A: %v", err)
+	}
+
+	respB := getWithAuth(t, srv.URL+"/v1/identity/"+alice.identityRef+"/prekey-bundle?deviceId=device-does-not-exist-at-all", bobToken)
+	defer respB.Body.Close()
+	bodyB, err := io.ReadAll(respB.Body)
+	if err != nil {
+		t.Fatalf("read body B: %v", err)
+	}
+
+	if respA.StatusCode != respB.StatusCode || respA.StatusCode != http.StatusOK {
+		t.Fatalf("expected identical 200 for both cases, got %d (real-but-unpublished device) vs %d (nonexistent device)", respA.StatusCode, respB.StatusCode)
+	}
+	if !bytes.Equal(bodyA, bodyB) {
+		t.Fatalf("expected byte-for-byte identical response bodies against the real live server, got %q (real-but-unpublished device) vs %q (nonexistent device) — real enumeration oracle", bodyA, bodyB)
+	}
+}
+
 func TestBindDevice_ForgedSignature_Rejected(t *testing.T) {
 	srv := newTestServer(t)
 	id := createTestIdentity(t, srv.URL)
@@ -1054,4 +1354,3 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("/healthz: expected 200, got %d", resp.StatusCode)
 	}
 }
-

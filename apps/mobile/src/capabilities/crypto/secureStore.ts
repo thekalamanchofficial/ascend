@@ -105,6 +105,26 @@ export async function secureLocalRetrieve(key: string): Promise<Uint8Array> {
   return softwareVaultRetrieve(key);
 }
 
+/**
+ * Permanently deletes a stored value. NOT one of this capability's frozen 9
+ * RPCs (packages/contracts/proto/ascend/crypto/v1/crypto.proto has no
+ * `SecureLocalDelete`) — this is an internal, non-contract seam, the same
+ * status `setFallbackKeyProvider` above already has. Its one caller today
+ * is prekeyStore.ts's `consumeOneTimePrekey`, which needs the atomic
+ * lookup-and-permanently-delete charter §6 requires for one-time-prekey
+ * consumption; exposing a generic delete only where it's actually needed,
+ * rather than promoting it to a public capability operation, keeps this
+ * capability's contract surface exactly as frozen.
+ */
+export async function secureLocalDelete(key: string): Promise<void> {
+  if (await isOsSecureStoreAvailable()) {
+    await SecureStore.deleteItemAsync(key);
+  } else {
+    softwareVault.delete(key);
+  }
+  logAuditEvent("secure_local_delete", { keyFingerprint: auditFingerprint(key) });
+}
+
 /** Test-only: clears in-memory fallback vault state between test cases. */
 export function _resetFallbackVaultForTests(): void {
   softwareVault.clear();

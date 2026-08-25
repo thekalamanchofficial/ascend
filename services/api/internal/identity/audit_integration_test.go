@@ -18,7 +18,7 @@ func TestRealAuditServiceSatisfiesAuditEmitter(t *testing.T) {
 	var _ AuditEmitter = (*audit.Service)(nil) // compile-time assertion
 
 	auditSvc := audit.NewService(audit.NewInMemoryStore(), nil)
-	svc := NewService(NewInMemoryStore(), auditSvc)
+	svc := NewService(NewInMemoryStore(), NewInMemoryPrekeyStore(), auditSvc)
 
 	pub, _, err := ed25519.GenerateKey(nil)
 	if err != nil {

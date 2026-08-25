@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/cors"
 
 	"github.com/ascend/services/api/internal/audit"
+	"github.com/ascend/services/api/internal/conversations"
 	"github.com/ascend/services/api/internal/fileobjects"
 	"github.com/ascend/services/api/internal/identity"
 	"github.com/ascend/services/api/internal/permissions"
@@ -146,7 +147,13 @@ func newRouter(plat *platform.Platform) http.Handler {
 	checker.svc = permsSvc // patch the late-bound reference now that both exist
 
 	identityStore := identity.NewPostgresStore(plat.DB)
-	identitySvc := identity.NewService(identityStore, auditSvc) // *audit.Service satisfies identity.AuditEmitter directly (type-alias ResourceRef)
+	// identityPrekeyStore backs PublishPrekeyBundle/FetchPrekeyBundle
+	// (prekey bundle publish/fetch amendment, docs/DECISION_LOG.md,
+	// 2026-08-20) — a second, separate Postgres-backed store from
+	// identityStore above, per identity/prekey_store.go's own doc comment
+	// on why PrekeyStore is not folded into Store.
+	identityPrekeyStore := identity.NewPostgresPrekeyStore(plat.DB)
+	identitySvc := identity.NewService(identityStore, identityPrekeyStore, auditSvc) // *audit.Service satisfies identity.AuditEmitter directly (type-alias ResourceRef)
 
 	// Session/Request Authentication is Batch C (docs/DECISION_LOG.md,
 	// 2026-08-17, "Batch C (Session/Request Authentication) design"), the
@@ -199,6 +206,24 @@ func newRouter(plat *platform.Platform) http.Handler {
 		log.Fatalf("constructing file objects service: %v", err)
 	}
 
+	// Conversations (docs/capabilities/conversations.charter.md, gated
+	// 2026-08-19): the platform's first messaging surface. Constructed
+	// after permsSvc/auditSvc exist, like fileobjectsSvc above — no
+	// dependency either way between Conversations and File Objects (this
+	// charter's §3 names File Objects only as a future attachment
+	// composition point, not a v1 dependency). Its own NewService calls
+	// DefinePolicy on permsSvc via conversationsPermissionsClientAdapter,
+	// registering "conversation"'s default policy, mirroring Storage's/
+	// File Objects' identical DefinePolicy-at-construction discipline.
+	conversationsSvc, err := conversations.NewService(
+		conversations.NewPostgresStore(plat.DB),
+		conversationsPermissionsClientAdapter{perms: permsSvc},
+		conversationsAuditEmitterAdapter{audit: auditSvc},
+	)
+	if err != nil {
+		log.Fatalf("constructing conversations service: %v", err)
+	}
+
 	// --- HTTP layer ---
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -224,6 +249,17 @@ func newRouter(plat *platform.Platform) http.Handler {
 	r.Mount("/v1/identity", identity.Mount(
 		identitySvc,
 		requireCallerMatchesIdentity(sessionAuthSvc, "identityRef"),
+		// PublishPrekeyBundle's device-level caller-binding check (charter
+		// §6, prekey bundle publish/fetch amendment) — see wiring.go's
+		// requireCallerMatchesIdentityAndDevice doc comment.
+		requireCallerMatchesIdentityAndDevice(sessionAuthSvc, "identityRef", "deviceId"),
+		// FetchPrekeyBundle's "any authenticated caller" gate — same
+		// requireVerifiedCaller middleware Audit/Permissions/Storage/File
+		// Objects already use, applied here to a single route via
+		// r.With(...) inside identity.Mount rather than an outer r.Group,
+		// since every other route mounted at /v1/identity is gated
+		// differently (or not at all).
+		requireVerifiedCaller(sessionAuthSvc),
 	))
 
 	// Audit and Permissions both derive the acting identity entirely from
@@ -253,12 +289,27 @@ func newRouter(plat *platform.Platform) http.Handler {
 		r.Use(requireVerifiedCaller(sessionAuthSvc))
 		fileobjects.Mount(r, fileobjectsSvc)
 	})
+	// Conversations reads the verified caller directly from
+	// verifiedCallerHeader inside its own handlers (mirroring Audit's/
+	// Storage's/File Objects' Mount shape), so requireVerifiedCaller is
+	// applied externally via r.Group here too.
+	r.Group(func(r chi.Router) {
+		r.Use(requireVerifiedCaller(sessionAuthSvc))
+		conversations.Mount(r, conversationsSvc)
+	})
 
 	return r
 }
 
 func main() {
 	ctx := context.Background()
+
+	// Local-dev convenience: fill in any environment variable not already
+	// set from a .env file found by walking up from the cwd (see
+	// platform.LoadDotEnv's doc comment). No-op wherever no .env exists,
+	// which is every real deployment -- ConfigFromEnv below is still the
+	// actual source of truth for what's required.
+	platform.LoadDotEnv()
 
 	// Platform (Postgres pool + migrations, Redis client, S3-compatible
 	// client) is constructed once, here, before any capability — every

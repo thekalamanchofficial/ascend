@@ -30,7 +30,7 @@ function formatUnixSeconds(unixSeconds: number): string {
 export function DevicesScreen() {
   const navigation = useNavigation<NativeStackNavigationProp>();
   const route = useRoute<DevicesRouteProp>();
-  const { identityRef, deviceId: thisDeviceId, sessionToken, displayName } = route.params;
+  const { identityRef, deviceId: thisDeviceId, sessionToken, displayName, privateKeyHandle } = route.params;
 
   const [devices, setDevices] = React.useState<Device[]>([]);
   const [sessions, setSessions] = React.useState<SessionSummary[]>([]);
@@ -172,6 +172,21 @@ export function DevicesScreen() {
         style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
       >
         <Text>Files</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() =>
+          navigation.navigate("Conversations", {
+            identityRef,
+            deviceId: thisDeviceId,
+            sessionToken,
+            displayName,
+            privateKeyHandle,
+          })
+        }
+        style={{ borderWidth: 1, borderColor: "#111", padding: 12, borderRadius: 8, alignItems: "center" }}
+      >
+        <Text>Messages</Text>
       </Pressable>
 
       <Pressable

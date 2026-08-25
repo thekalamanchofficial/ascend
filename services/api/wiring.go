@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ascend/services/api/internal/audit"
+	"github.com/ascend/services/api/internal/conversations"
 	"github.com/ascend/services/api/internal/fileobjects"
 	"github.com/ascend/services/api/internal/identity"
 	"github.com/ascend/services/api/internal/permissions"
@@ -267,6 +268,63 @@ func (a fileobjectsAuditEmitterAdapter) Emit(actor, action string, resource file
 	}, ruleReference, metadata)
 }
 
+// conversationsPermissionsClientAdapter satisfies conversations.PermissionsClient
+// by forwarding to a real *permissions.Service. Conversations never decides
+// allow/deny itself (charter §3's Consumes correction) — every method here
+// is a direct, unmediated forward to Permissions' own decision, plus the
+// bootstrap GrantPermission/DefinePolicy-at-construction bookkeeping
+// CreateConversation's own logic (service.go) makes. Narrower than
+// fileobjectsPermissionsClientAdapter above: no RevokePermission/
+// ListGrantsForResource methods — conversations.PermissionsClient
+// (internal/conversations/types.go) deliberately excludes both (see that
+// interface's own doc comment for why).
+type conversationsPermissionsClientAdapter struct {
+	perms *permissions.Service
+}
+
+func (a conversationsPermissionsClientAdapter) CheckPermission(subject, action, resourceType, resourceID string) (bool, error) {
+	resp, err := a.perms.CheckPermission(permissions.CheckPermissionRequest{
+		Subject:  subject,
+		Action:   action,
+		Resource: permissions.ResourceRef{ResourceType: resourceType, ResourceID: resourceID},
+	})
+	if err != nil {
+		return false, err
+	}
+	return resp.Allowed, nil
+}
+
+func (a conversationsPermissionsClientAdapter) GrantPermission(grantor, subject, action, resourceType, resourceID, scope string) error {
+	_, err := a.perms.GrantPermission(permissions.GrantPermissionRequest{
+		Grantor:  grantor,
+		Subject:  subject,
+		Action:   action,
+		Resource: permissions.ResourceRef{ResourceType: resourceType, ResourceID: resourceID},
+		Scope:    scope,
+	})
+	return err
+}
+
+func (a conversationsPermissionsClientAdapter) DefinePolicy(resourceType, defaultRules string) error {
+	_, err := a.perms.DefinePolicy(permissions.DefinePolicyRequest{ResourceType: resourceType, DefaultRules: defaultRules})
+	return err
+}
+
+// conversationsAuditEmitterAdapter satisfies conversations.AuditEmitter by
+// forwarding to a real *audit.Service, converting conversations' own local
+// ResourceRef shape into audit's — same pattern as every other
+// *AuditEmitter adapter in this file.
+type conversationsAuditEmitterAdapter struct {
+	audit *audit.Service
+}
+
+func (a conversationsAuditEmitterAdapter) Emit(actor, action string, resource conversations.ResourceRef, ruleReference string, metadata map[string]string) (string, error) {
+	return a.audit.Emit(actor, action, audit.ResourceRef{
+		ResourceType: resource.ResourceType,
+		ResourceID:   resource.ResourceID,
+	}, ruleReference, metadata)
+}
+
 // deviceResolverAdapter satisfies sessionauth.DeviceResolver by forwarding
 // to a real *identity.Service. Identity has no dedicated single-device
 // lookup method — ListDevices is the closest fit, so this adapter fetches
@@ -361,6 +419,81 @@ func requireCallerMatchesIdentity(sessions *sessionauth.Service, pathParam strin
 			pathIdentityRef := chi.URLParam(r, pathParam)
 			if pathIdentityRef == "" || pathIdentityRef != resp.IdentityRef {
 				writeJSONError(w, http.StatusForbidden, "caller's session does not match the requested identity")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireCallerMatchesIdentityAndDevice builds the middleware Identity's
+// Mount applies to PublishPrekeyBundle (docs/DECISION_LOG.md, the prekey
+// bundle publish/fetch amendment's implementation entry).
+//
+// FLAGGED FOR CHIEF ARCHITECT REVIEW: this function, like
+// requireCallerMatchesIdentity immediately above it, is shared,
+// composition-root infrastructure — Chief-Architect-owned, not Identity's
+// own code — even though this specific capability engineer added it,
+// because a session-layer verified device_id is genuinely new plumbing
+// that could plausibly be reused by any future capability that needs
+// device-level (not just identity-level) caller binding, not something
+// scoped only to this one RPC.
+//
+// This is a NEW check, not a parameterization of requireCallerMatchesIdentity
+// (charter §6, both guardians, round 1: "a capability engineer who reuses
+// requireCallerMatchesIdentity unmodified for PublishPrekeyBundle would
+// correctly bind identity but leave device_id completely unchecked...
+// required, not merely flagged for the merge gate: this RPC needs a new,
+// explicit device_id-binding check sourced from ValidateSession's verified
+// device_id, which does not yet exist anywhere in this codebase and must
+// not be assumed to fall out of reusing existing middleware"). The
+// underlying guarantee this needs already existed before this change:
+// sessionauth.ValidateSessionResponse has genuinely carried a
+// cryptographically-verified DeviceID since IssueSession's own
+// proof-of-possession check (internal/sessionauth/service.go's
+// IssueSession, step 3) — nothing before this change actually READ that
+// field anywhere in this codebase's HTTP-gating layer. This function is
+// the first thing that does.
+//
+// Validates the caller's bearer session token exactly like
+// requireCallerMatchesIdentity, then additionally requires the resulting
+// resp.DeviceID to equal the {devicePathParam} URL path parameter, in
+// addition to the existing resp.IdentityRef == {identityPathParam} check
+// — a caller may only publish a prekey bundle for their own identity's OWN
+// verified device, never a different device of the same identity (the
+// narrower, still-genuine impersonation risk charter §6 names explicitly:
+// "any of a multi-device identity's own already-bound devices could
+// publish a bogus bundle for a different device of the same identity").
+//
+// Identity's own package never sees this function's implementation or
+// imports sessionauth — same Art. 10 modularity discipline
+// requireCallerMatchesIdentity already follows; it only receives the
+// finished func(http.Handler) http.Handler.
+func requireCallerMatchesIdentityAndDevice(sessions *sessionauth.Service, identityPathParam, devicePathParam string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := bearerToken(r)
+			if token == "" {
+				writeJSONError(w, http.StatusUnauthorized, "missing bearer session token")
+				return
+			}
+			resp, err := sessions.ValidateSession(sessionauth.ValidateSessionRequest{SessionToken: token})
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "session validation failed")
+				return
+			}
+			if !resp.Valid {
+				writeJSONError(w, http.StatusUnauthorized, "invalid or expired session")
+				return
+			}
+			pathIdentityRef := chi.URLParam(r, identityPathParam)
+			pathDeviceID := chi.URLParam(r, devicePathParam)
+			if pathIdentityRef == "" || pathIdentityRef != resp.IdentityRef {
+				writeJSONError(w, http.StatusForbidden, "caller's session does not match the requested identity")
+				return
+			}
+			if pathDeviceID == "" || pathDeviceID != resp.DeviceID {
+				writeJSONError(w, http.StatusForbidden, "caller's session does not match the requested device")
 				return
 			}
 			next.ServeHTTP(w, r)
