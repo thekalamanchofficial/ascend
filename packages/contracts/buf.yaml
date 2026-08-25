@@ -7,3 +7,28 @@ lint:
 breaking:
   use:
     - FILE
+  # Scoped, documented exception — NOT a general relaxation of breaking-change
+  # protection. DeriveSharedSecretRequest's field 2 (crypto.proto) was
+  # deliberately corrected from `remote_public_key` to
+  # `their_identity_signing_public_key` as part of the 2026-08-21 key-
+  # separation fix (docs/DECISION_LOG.md, "Key-separation fix" series,
+  # eight guardian-gate rounds) — the field's *meaning* was corrected, not
+  # merely its name (the actual DH-capable key moved into
+  # their_prekey_bundle; field 2 became the Ed25519 signing-key trust
+  # anchor). `crypto.proto` has no real external consumer yet (internal to
+  # this monorepo; Go/TS bindings are always built from the same commit),
+  # so a deliberate, fully-reviewed correction like this is not the risk
+  # this check exists to catch. FIELD_SAME_NAME/FIELD_SAME_JSON_NAME are
+  # buf's only breaking rules with no field-level ignore granularity —
+  # file-level is the finest this config supports — so this is scoped to
+  # exactly those two rules, on exactly this one file, not a broader
+  # exception. TODO(chief-architect): remove this ignore in the first PR
+  # after this one merges to main — once main reflects the corrected
+  # shape, this exception no longer has anything to except, and leaving it
+  # in place past that point would silently weaken protection against a
+  # genuinely accidental future rename in this file.
+  ignore_only:
+    FIELD_SAME_NAME:
+      - proto/ascend/crypto/v1/crypto.proto
+    FIELD_SAME_JSON_NAME:
+      - proto/ascend/crypto/v1/crypto.proto
