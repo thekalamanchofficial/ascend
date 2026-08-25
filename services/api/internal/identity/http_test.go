@@ -32,7 +32,7 @@ func alwaysForbiddenMiddleware(next http.Handler) http.Handler {
 // shapes, URL params) rather than re-testing business logic.
 func TestMount_CreateResolveBindHTTP(t *testing.T) {
 	svc, _ := newTestService()
-	server := httptest.NewServer(Mount(svc, passThroughMiddleware))
+	server := httptest.NewServer(Mount(svc, passThroughMiddleware, passThroughMiddleware, passThroughMiddleware))
 	defer server.Close()
 
 	identityPub, _ := mustGenerateKey(t)
@@ -106,7 +106,14 @@ func TestMount_CreateResolveBindHTTP(t *testing.T) {
 // returns 403 and confirming those three routes never reach the real handler.
 func TestMount_MiddlewareGatesOnlySensitiveRoutes(t *testing.T) {
 	svc, _ := newTestService()
-	server := httptest.NewServer(Mount(svc, alwaysForbiddenMiddleware))
+	// Only requireCallerMatchesIdentity is the always-403 middleware here —
+	// the two new prekey middlewares are pass-through, so this test's
+	// original scope (proving requireCallerMatchesIdentity gates exactly
+	// RevokeDevice/ListDevices/ExportIdentity) is unaffected. See
+	// TestMount_PublishPrekeyBundle_GatedByDeviceBindingMiddleware and
+	// TestMount_FetchPrekeyBundle_GatedByVerifiedCallerMiddleware below for
+	// the two new middlewares' own dedicated gating proofs.
+	server := httptest.NewServer(Mount(svc, alwaysForbiddenMiddleware, passThroughMiddleware, passThroughMiddleware))
 	defer server.Close()
 
 	identityPub, _ := mustGenerateKey(t)
@@ -165,7 +172,7 @@ func TestMount_MiddlewareGatesOnlySensitiveRoutes(t *testing.T) {
 // applied router-wide.
 func TestMount_MiddlewareDoesNotAffectUnwrappedRoutes(t *testing.T) {
 	svc, _ := newTestService()
-	server := httptest.NewServer(Mount(svc, alwaysForbiddenMiddleware))
+	server := httptest.NewServer(Mount(svc, alwaysForbiddenMiddleware, passThroughMiddleware, passThroughMiddleware))
 	defer server.Close()
 
 	identityPub, _ := mustGenerateKey(t)
@@ -221,5 +228,116 @@ func TestMount_MiddlewareDoesNotAffectUnwrappedRoutes(t *testing.T) {
 	defer bindResp.Body.Close()
 	if bindResp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /{identityRef}/devices status = %d, want 200 (BindDevice must not be gated)", bindResp.StatusCode)
+	}
+}
+
+// TestMount_PublishPrekeyBundle_GatedByDeviceBindingMiddleware proves
+// PublishPrekeyBundle is gated by the requireCallerMatchesIdentityAndDevice
+// parameter specifically — a real requireCallerMatchesIdentity-shaped
+// pass-through middleware for the OTHER two Mount parameters would not
+// have blocked this route if wiring.go's Mount call ever accidentally
+// passed the wrong middleware into the wrong parameter position.
+func TestMount_PublishPrekeyBundle_GatedByDeviceBindingMiddleware(t *testing.T) {
+	svc, _ := newTestService()
+	server := httptest.NewServer(Mount(svc, passThroughMiddleware, alwaysForbiddenMiddleware, passThroughMiddleware))
+	defer server.Close()
+
+	identityPub, _ := mustGenerateKey(t)
+	devicePub, _ := mustGenerateKey(t)
+	created, err := svc.CreateIdentity(CreateIdentityRequest{
+		DisplayName:          "Prekey Gate User",
+		PublicKey:            identityPub,
+		FirstDevicePublicKey: devicePub,
+		FirstDeviceName:      "Primary",
+	})
+	if err != nil {
+		t.Fatalf("CreateIdentity setup: %v", err)
+	}
+
+	body, _ := json.Marshal(PublishPrekeyBundleRequest{SignedPrekey: testSignedPrekey("spk-1")})
+	resp, err := http.Post(
+		server.URL+"/"+created.PublicIdentity.IdentityRef+"/devices/"+created.FirstDevice.DeviceID+"/prekeys",
+		"application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("POST .../prekeys: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST .../prekeys status = %d, want 403 (requireCallerMatchesIdentityAndDevice should have blocked this)", resp.StatusCode)
+	}
+}
+
+// TestMount_FetchPrekeyBundle_GatedByVerifiedCallerMiddleware proves
+// FetchPrekeyBundle is gated by the requireVerifiedCaller parameter
+// specifically, and NOT by requireCallerMatchesIdentity (which stays
+// pass-through here) — this route must be reachable by ANY authenticated
+// caller regardless of whose identity_ref is in the URL, so it is
+// deliberately the requireVerifiedCaller-shaped middleware, not the
+// identity-matching one, that is exercised here.
+func TestMount_FetchPrekeyBundle_GatedByVerifiedCallerMiddleware(t *testing.T) {
+	svc, _ := newTestService()
+	server := httptest.NewServer(Mount(svc, passThroughMiddleware, passThroughMiddleware, alwaysForbiddenMiddleware))
+	defer server.Close()
+
+	identityPub, _ := mustGenerateKey(t)
+	devicePub, _ := mustGenerateKey(t)
+	created, err := svc.CreateIdentity(CreateIdentityRequest{
+		DisplayName:          "Fetch Gate User",
+		PublicKey:            identityPub,
+		FirstDevicePublicKey: devicePub,
+		FirstDeviceName:      "Primary",
+	})
+	if err != nil {
+		t.Fatalf("CreateIdentity setup: %v", err)
+	}
+
+	resp, err := http.Get(server.URL + "/" + created.PublicIdentity.IdentityRef + "/prekey-bundle")
+	if err != nil {
+		t.Fatalf("GET .../prekey-bundle: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET .../prekey-bundle status = %d, want 403 (requireVerifiedCaller should have blocked this)", resp.StatusCode)
+	}
+}
+
+// TestMount_FetchPrekeyBundle_ReachableForAnyCaller_NotIdentityGated proves
+// the converse: with requireCallerMatchesIdentity forced to always-403 (as
+// TestMount_MiddlewareGatesOnlySensitiveRoutes already exercises for the
+// other three routes) but requireVerifiedCaller pass-through,
+// FetchPrekeyBundle must still succeed — it is deliberately NOT gated by
+// caller-identity-matching at all (charter §3/§6).
+func TestMount_FetchPrekeyBundle_ReachableForAnyCaller_NotIdentityGated(t *testing.T) {
+	svc, _ := newTestService()
+	server := httptest.NewServer(Mount(svc, alwaysForbiddenMiddleware, passThroughMiddleware, passThroughMiddleware))
+	defer server.Close()
+
+	identityPub, _ := mustGenerateKey(t)
+	devicePub, _ := mustGenerateKey(t)
+	created, err := svc.CreateIdentity(CreateIdentityRequest{
+		DisplayName:          "Fetch Openness User",
+		PublicKey:            identityPub,
+		FirstDevicePublicKey: devicePub,
+		FirstDeviceName:      "Primary",
+	})
+	if err != nil {
+		t.Fatalf("CreateIdentity setup: %v", err)
+	}
+
+	resp, err := http.Get(server.URL + "/" + created.PublicIdentity.IdentityRef + "/prekey-bundle")
+	if err != nil {
+		t.Fatalf("GET .../prekey-bundle: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET .../prekey-bundle status = %d, want 200 (must not be gated by requireCallerMatchesIdentity)", resp.StatusCode)
+	}
+	var parsed FetchPrekeyBundleResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if parsed.Status != PrekeyBundleStatusNotPublished {
+		t.Fatalf("expected NOT_PUBLISHED (no bundle published yet), got %v", parsed.Status)
 	}
 }

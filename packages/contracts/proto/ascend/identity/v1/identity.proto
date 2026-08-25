@@ -46,6 +46,34 @@ service IdentityService {
   // Complete, user-readable export of the identity record and device list
   // (Art. 9).
   rpc ExportIdentity(ExportIdentityRequest) returns (ExportIdentityResponse);
+
+  // AMENDED 2026-08-20 (prekey bundle publish/fetch — see
+  // docs/capabilities/identity.charter.md §3/§6/§7, gated 2026-08-20, the
+  // Cryptography & Keys amendment's own named follow-up: that capability
+  // generates and signs prekey bundles but has no network component to
+  // publish them). Pure storage/relay for public prekey material Crypto
+  // already generated and signed — this service never generates, signs, or
+  // touches private key material here either, the same role it already
+  // plays for device_public_key above.
+
+  // identity_ref/device_id must equal the network-verified caller's own
+  // identity AND device (charter §6 — a NEW device-level check sourced
+  // from the session layer's verified device_id, distinct from and
+  // additional to the identity-level check every other gated RPC here
+  // uses; nothing in this codebase's existing middleware does device-level
+  // binding today, stated explicitly so it isn't silently assumed to fall
+  // out of reusing the existing identity-only check).
+  rpc PublishPrekeyBundle(PublishPrekeyBundleRequest) returns (PublishPrekeyBundleResponse);
+
+  // The one deliberately open, non-self-scoped read this capability
+  // exposes (mirroring ResolveIdentity's openness on the confidentiality
+  // axis only — charter §6 explicitly does NOT extend that analogy to the
+  // behavioral axis, since this call also atomically consumes and deletes
+  // a scarce one-time prekey on every successful fetch, a resource-
+  // depleting side effect ResolveIdentity never had). Any authenticated
+  // caller may fetch any identity's bundle — required for an initiator who
+  // has never talked to someone before to reach their key material at all.
+  rpc FetchPrekeyBundle(FetchPrekeyBundleRequest) returns (FetchPrekeyBundleResponse);
 }
 
 message Device {
@@ -54,6 +82,32 @@ message Device {
   bytes public_key = 3;
   int64 added_at_unix = 4;
   int64 last_seen_unix = 5;
+  // Added 2026-08-20 (prekey bundle publish/fetch amendment, §6's
+  // "Prekey exhaustion as an abuse vector" compounding-risk fix): a
+  // self-only, count-only passive signal — never per-fetch, never
+  // per-fetcher — letting a device's own owner notice abnormal prekey
+  // depletion. Derived from the same pool SignedPrekey/OneTimePrekeyPublic
+  // below cover; not a new category of collected material.
+  int32 unconsumed_one_time_prekey_count = 6;
+}
+
+// Mirrors ascend.crypto.v1.SignedPrekey/OneTimePrekeyPublic exactly — this
+// service stores/relays the same public bytes Cryptography & Keys' own
+// GeneratePrekeyBundle produces and signs (charter §3/§4). Duplicated here
+// rather than importing crypto.proto: this service has no dependency on
+// Cryptography & Keys' package, only on the shape of public bytes handed
+// to it as plain RPC input (charter §3's Consumes note — publishing is
+// agnostic to how the caller obtained these bytes).
+message SignedPrekey {
+  string prekey_id = 1;
+  bytes public_key = 2;
+  bytes signature = 3;
+  int64 created_at_unix = 4;
+}
+
+message OneTimePrekeyPublic {
+  string prekey_id = 1;
+  bytes public_key = 2;
 }
 
 message PublicIdentity {
@@ -131,4 +185,98 @@ message ExportIdentityRequest {
 message ExportIdentityResponse {
   bytes export_blob = 1;
   string format_version = 2;
+}
+
+message PublishPrekeyBundleRequest {
+  string identity_ref = 1;
+  string device_id = 2;
+  // Replaces this device's current signed prekey (rotation).
+  SignedPrekey signed_prekey = 3;
+  // Additively appends to this device's available pool — never removes or
+  // replaces an existing unconsumed one-time prekey (charter §3).
+  repeated OneTimePrekeyPublic one_time_prekeys = 4;
+  // Added 2026-08-21 (Cryptography & Keys' key-separation fix, that
+  // charter's §3 — Security Steward implementation-merge-gate finding):
+  // the device's X25519 DH-capable identity public key
+  // (Cryptography & Keys' GeneratePrekeyBundleResponse.identity_dh_public_key)
+  // — genuinely separate from identity_ref's own Ed25519 public_key
+  // (CreateIdentity/ResolveIdentity), never interchangeable with it.
+  // Identity cannot derive this value independently; it must be
+  // republished here.
+  bytes identity_dh_public_key = 5;
+  // Added 2026-08-21, same fix, round 2 (Security Steward finding: an
+  // unsigned identity_dh_public_key is a substitution surface a
+  // compromised publish/fetch path could exploit). Signed with the
+  // identity's Ed25519 signing key at GeneratePrekeyBundle time
+  // (Cryptography & Keys' GeneratePrekeyBundleResponse.identity_dh_public_key_signature)
+  // — Identity stores and relays this verbatim, never generates or
+  // checks it itself (pure storage/relay, unchanged discipline).
+  bytes identity_dh_public_key_signature = 6;
+}
+
+message PublishPrekeyBundleResponse {
+  int32 published_count = 1;
+}
+
+// Contract-freezing decision, 2026-08-20 (see docs/DECISION_LOG.md):
+// charter §3 requires a "no bundle published" result be byte-for-byte
+// identical whether device_id is genuinely unbound OR the device simply
+// hasn't published yet (§3's brand-new-identity resolution) OR (§6's
+// enumeration-oracle closure) device_id doesn't belong to identity_ref at
+// all. An explicit status enum, rather than relying on message-field
+// presence (which can differ across this codebase's Go/hand-mirrored-TS/
+// Python consumers), is what actually guarantees that identical-response
+// requirement is enforceable by construction, not by implementer
+// discipline.
+enum PrekeyBundleStatus {
+  PREKEY_BUNDLE_STATUS_UNSPECIFIED = 0;
+  PREKEY_BUNDLE_STATUS_AVAILABLE = 1;
+  // Covers both "no bundle ever published for this device" and "device_id
+  // not bound to identity_ref" — deliberately the same value, deliberately
+  // indistinguishable to the caller (charter §3/§6).
+  PREKEY_BUNDLE_STATUS_NOT_PUBLISHED = 2;
+}
+
+message FetchPrekeyBundleRequest {
+  string identity_ref = 1;
+  // Optional; if omitted, resolves to the identity's most-recently-active
+  // bound device (charter §3) — a reasonable default for this freeze, not
+  // a solved multi-device answer (charter §7).
+  optional string device_id = 2;
+}
+
+message FetchPrekeyBundleResponse {
+  PrekeyBundleStatus status = 1;
+  // Fields below are populated only when status == PREKEY_BUNDLE_STATUS_AVAILABLE;
+  // all left at zero-value otherwise, so a NOT_PUBLISHED response is
+  // byte-for-byte identical regardless of which NOT_PUBLISHED case
+  // produced it.
+  //
+  // Renamed from identity_public_key, 2026-08-21 (key-separation fix):
+  // this is the target device's most-recently-published X25519 DH-capable
+  // key, NOT the Ed25519 signing key ResolveIdentity returns. A device
+  // that published a signed_prekey but never an identity_dh_public_key
+  // (pre-fix client) must resolve to PREKEY_BUNDLE_STATUS_NOT_PUBLISHED,
+  // never fall back to returning the wrong (signing) key here.
+  bytes identity_dh_public_key = 2;
+  string device_id = 3;
+  SignedPrekey signed_prekey = 4;
+  // Absent when the target device's one-time-prekey pool is exhausted —
+  // this is the exhaustion-fallback case (Cryptography & Keys charter §6),
+  // distinct from PREKEY_BUNDLE_STATUS_NOT_PUBLISHED and only reachable
+  // when status == AVAILABLE.
+  optional OneTimePrekeyPublic one_time_prekey = 5;
+  // Added 2026-08-21, same fix, round 2: the identity's Ed25519 SIGNING
+  // public key (sourced from the identity record already established at
+  // CreateIdentity — the same value ResolveIdentity returns, unchanged by
+  // this fix), included here so a caller can verify signed_prekey's and
+  // identity_dh_public_key's signatures without a second round trip
+  // through ResolveIdentity. Genuinely distinct from identity_dh_public_key
+  // above — never the same bytes.
+  bytes identity_signing_public_key = 6;
+  // Verified by the caller against identity_signing_public_key before
+  // identity_dh_public_key is used in any DH computation — hard abort on
+  // failure, mirroring signed_prekey's own signature-verification
+  // discipline (Cryptography & Keys charter §6).
+  bytes identity_dh_public_key_signature = 7;
 }

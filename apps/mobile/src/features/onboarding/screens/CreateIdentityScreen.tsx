@@ -14,6 +14,7 @@
 import * as React from "react";
 import { View, Text, TextInput, Pressable, ActivityIndicator, ScrollView } from "react-native";
 import { useNavigation } from "@react-navigation/native";
+import * as Clipboard from "expo-clipboard";
 import type { NativeStackNavigationProp } from "../../../navigation/types";
 import { createIdentityFlow } from "../onboarding";
 import type { CreateIdentityResult } from "../onboarding";
@@ -29,6 +30,12 @@ export function CreateIdentityScreen() {
   const [error, setError] = React.useState<string | null>(null);
   const [result, setResult] = React.useState<CreateIdentityResult | null>(null);
   const [confirmedSaved, setConfirmedSaved] = React.useState(false);
+  // "Bring your own phrase" — opt-in, off by default (see onboarding.ts's
+  // createIdentityFlow doc comment for the full Art. 13/1/6 reasoning). Off
+  // by default so the zero-config CSPRNG-generated path remains the thing
+  // every user gets unless they deliberately reach for this.
+  const [useOwnPhrase, setUseOwnPhrase] = React.useState(false);
+  const [ownPhrase, setOwnPhrase] = React.useState("");
 
   async function handleCreate() {
     setError(null);
@@ -36,11 +43,16 @@ export function CreateIdentityScreen() {
       setError("Enter a display name and a name for this device.");
       return;
     }
+    if (useOwnPhrase && !ownPhrase.trim()) {
+      setError("Enter the recovery phrase you'd like to use, or turn off \"Use my own phrase\".");
+      return;
+    }
     setLoading(true);
     try {
       const created = await createIdentityFlow({
         displayName: displayName.trim(),
         firstDeviceName: deviceName.trim(),
+        customRecoveryPhrase: useOwnPhrase ? ownPhrase.trim() : undefined,
       });
       setResult(created);
       setStep("confirmPhrase");
@@ -51,6 +63,11 @@ export function CreateIdentityScreen() {
     }
   }
 
+  async function handlePasteOwnPhrase() {
+    const text = await Clipboard.getStringAsync();
+    if (text) setOwnPhrase(text);
+  }
+
   function handleContinue() {
     if (!result) return;
     navigation.navigate("Devices", {
@@ -58,6 +75,7 @@ export function CreateIdentityScreen() {
       deviceId: result.deviceId,
       sessionToken: result.sessionToken,
       displayName: result.displayName,
+      privateKeyHandle: result.identityPrivateKeyHandle,
     });
   }
 
@@ -136,6 +154,50 @@ export function CreateIdentityScreen() {
           style={{ borderWidth: 1, borderColor: "#999", borderRadius: 6, padding: 10 }}
         />
       </View>
+
+      <Pressable
+        onPress={() => setUseOwnPhrase((v) => !v)}
+        style={{ flexDirection: "row", alignItems: "center", gap: 8 }}
+      >
+        <View
+          style={{
+            width: 22,
+            height: 22,
+            borderWidth: 1,
+            borderColor: "#333",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {useOwnPhrase ? <Text>✓</Text> : null}
+        </View>
+        <Text>Use my own recovery phrase</Text>
+      </Pressable>
+
+      {useOwnPhrase ? (
+        <View style={{ gap: 8 }}>
+          <Text style={{ color: "#b00020" }}>
+            Your identity's security depends entirely on this phrase's randomness. Only use a phrase you generated
+            with a source you trust (e.g. another BIP-39-compliant wallet or device) — a phrase you made up yourself
+            is far weaker than one this app generates for you, and there's no way for Ascend to warn you if it's
+            guessable.
+          </Text>
+          <TextInput
+            value={ownPhrase}
+            onChangeText={setOwnPhrase}
+            autoCapitalize="none"
+            multiline
+            placeholder="Your own recovery phrase"
+            style={{ borderWidth: 1, borderColor: "#999", borderRadius: 6, padding: 10, minHeight: 80 }}
+          />
+          <Pressable
+            onPress={handlePasteOwnPhrase}
+            style={{ alignSelf: "flex-start", borderWidth: 1, borderColor: "#999", borderRadius: 6, padding: 8 }}
+          >
+            <Text>Paste from clipboard</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       {error ? <Text style={{ color: "#b00020" }}>{error}</Text> : null}
 

@@ -1,4 +1,4 @@
-// Identity — thin HTTP client for the six real, network-wired RPCs at
+// Identity — thin HTTP client for the eight real, network-wired RPCs at
 // /v1/identity (services/api/internal/identity/http.go). Per
 // apps/mobile/README.md's capability boundary, this module holds no
 // capability logic of its own — it only shapes requests/responses and
@@ -27,6 +27,13 @@ import type {
   ExportIdentityResponse,
   Device,
   PublicIdentity,
+  PublishPrekeyBundleRequest,
+  PublishPrekeyBundleResponse,
+  FetchPrekeyBundleRequest,
+  FetchPrekeyBundleResponse,
+  SignedPrekey,
+  OneTimePrekeyPublic,
+  PrekeyBundleStatus,
 } from "./types";
 
 export * from "./types";
@@ -41,6 +48,7 @@ interface WireDevice {
   publicKey: string;
   addedAtUnix: number;
   lastSeenUnix: number;
+  unconsumedOneTimePrekeyCount: number;
 }
 
 interface WirePublicIdentity {
@@ -250,4 +258,154 @@ export async function exportIdentity(
   logAuditEvent("identity_exported", { identityRef: request.identityRef, formatVersion: resp.formatVersion });
 
   return { exportBlob: base64ToBytes(resp.exportBlob), formatVersion: resp.formatVersion };
+}
+
+// ---------------------------------------------------------------------------
+// Prekey bundle publish/fetch (charter §3/§4/§6, amendment gated
+// 2026-08-20). Fully invisible, automatic machinery per charter §5
+// (amended) — no dedicated screen: publishPrekeyBundle is called by the
+// onboarding composition layer immediately after bindDevice succeeds
+// (charter §7's recommended client-orchestration mitigation for the
+// brand-new-identity edge case), and fetchPrekeyBundle is called by
+// Conversations' own lazy CreateConversation flow, not from a UI action
+// here.
+// ---------------------------------------------------------------------------
+
+// base64ToBytesOrEmpty guards against the real wire shape's `null`/absent
+// []byte fields — FetchPrekeyBundleResponse's fields below `status` are
+// left at Go zero-value when status is NOT_PUBLISHED (identity.proto's own
+// comment on FetchPrekeyBundleResponse), and Go's encoding/json marshals a
+// nil []byte with no `omitempty` (e.g. SignedPrekey.publicKey/signature)
+// as JSON `null`, not an empty string — base64ToBytes itself has no
+// null-guard (it assumes a real base64 string), so this wrapper is what
+// actually makes decoding a NOT_PUBLISHED response safe rather than
+// throwing.
+function base64ToBytesOrEmpty(value: string | null | undefined): Uint8Array {
+  if (!value) return new Uint8Array(0);
+  return base64ToBytes(value);
+}
+
+interface WireSignedPrekey {
+  prekeyId: string;
+  publicKey: string | null;
+  signature: string | null;
+  createdAtUnix: number;
+}
+
+interface WireOneTimePrekeyPublic {
+  prekeyId: string;
+  publicKey: string;
+}
+
+function signedPrekeyFromWire(w: WireSignedPrekey): SignedPrekey {
+  return {
+    prekeyId: w.prekeyId,
+    publicKey: base64ToBytesOrEmpty(w.publicKey),
+    signature: base64ToBytesOrEmpty(w.signature),
+    createdAtUnix: w.createdAtUnix,
+  };
+}
+
+function signedPrekeyToWire(s: SignedPrekey): WireSignedPrekey {
+  return {
+    prekeyId: s.prekeyId,
+    publicKey: bytesToBase64(s.publicKey),
+    signature: bytesToBase64(s.signature),
+    createdAtUnix: s.createdAtUnix,
+  };
+}
+
+function oneTimePrekeyFromWire(w: WireOneTimePrekeyPublic): OneTimePrekeyPublic {
+  return { prekeyId: w.prekeyId, publicKey: base64ToBytes(w.publicKey) };
+}
+
+function oneTimePrekeyToWire(o: OneTimePrekeyPublic): WireOneTimePrekeyPublic {
+  return { prekeyId: o.prekeyId, publicKey: bytesToBase64(o.publicKey) };
+}
+
+/**
+ * PublishPrekeyBundle — replaces the caller's own device's current signed
+ * prekey (rotation) and additively appends oneTimePrekeys to that device's
+ * pool. Gated: the caller's sessionToken must authorize BOTH
+ * request.identityRef AND request.deviceId as the verified caller's own
+ * (server-enforced device-level check — see
+ * services/api/wiring.go's requireCallerMatchesIdentityAndDevice). Every
+ * value here is already-public, already-signed bytes Cryptography & Keys'
+ * generatePrekeyBundle produced — this function never generates, signs, or
+ * inspects private key material.
+ */
+// ascend:mutates
+export async function publishPrekeyBundle(
+  request: PublishPrekeyBundleRequest,
+  sessionToken: string,
+): Promise<PublishPrekeyBundleResponse> {
+  const resp = await apiRequest<{ publishedCount: number }>(
+    `/v1/identity/${encodeURIComponent(request.identityRef)}/devices/${encodeURIComponent(request.deviceId)}/prekeys`,
+    {
+      method: "POST",
+      bearerToken: sessionToken,
+      body: {
+        signedPrekey: signedPrekeyToWire(request.signedPrekey),
+        oneTimePrekeys: request.oneTimePrekeys.map(oneTimePrekeyToWire),
+        // identityDhPublicKey/identityDhPublicKeySignature (key-separation
+        // fix, charter §3) — stable, non-rotating per device, but sent on
+        // every call anyway; this module never generates or verifies
+        // them, only relays crypto.generatePrekeyBundle's own output.
+        identityDhPublicKey: bytesToBase64(request.identityDhPublicKey),
+        identityDhPublicKeySignature: bytesToBase64(request.identityDhPublicKeySignature),
+      },
+    },
+  );
+
+  logAuditEvent("prekey_bundle_published", {
+    identityRef: request.identityRef,
+    deviceId: request.deviceId,
+    publishedCount: String(resp.publishedCount),
+  });
+
+  return { publishedCount: resp.publishedCount };
+}
+
+/**
+ * FetchPrekeyBundle — the one deliberately open, non-self-scoped read this
+ * capability exposes (charter §3/§6): any authenticated caller may fetch
+ * any identity's bundle, gated only by sessionToken identifying SOME valid
+ * session (never checked against request.identityRef). Atomically consumes
+ * one available one-time prekey from the target device's pool on every
+ * successful (AVAILABLE-status) call — marked ascend:mutates for that
+ * reason (mirroring services/api/internal/identity/service.go's own
+ * FetchPrekeyBundle marking) even though it is framed as a "fetch"/read,
+ * exactly the same "open-to-any-caller read with a real, resource-
+ * depleting write side effect" reasoning charter §6 states explicitly.
+ */
+// ascend:mutates
+export async function fetchPrekeyBundle(
+  request: FetchPrekeyBundleRequest,
+  sessionToken: string,
+): Promise<FetchPrekeyBundleResponse> {
+  const query = request.deviceId ? `?deviceId=${encodeURIComponent(request.deviceId)}` : "";
+  const resp = await apiRequest<{
+    status: PrekeyBundleStatus;
+    identityDhPublicKey?: string | null;
+    deviceId?: string;
+    signedPrekey: WireSignedPrekey;
+    oneTimePrekey?: WireOneTimePrekeyPublic | null;
+    identitySigningPublicKey?: string | null;
+    identityDhPublicKeySignature?: string | null;
+  }>(`/v1/identity/${encodeURIComponent(request.identityRef)}/prekey-bundle${query}`, {
+    method: "GET",
+    bearerToken: sessionToken,
+  });
+
+  logAuditEvent("prekey_bundle_fetched", { identityRef: request.identityRef, status: resp.status });
+
+  return {
+    status: resp.status,
+    identityDhPublicKey: base64ToBytesOrEmpty(resp.identityDhPublicKey),
+    deviceId: resp.deviceId ?? "",
+    signedPrekey: signedPrekeyFromWire(resp.signedPrekey),
+    oneTimePrekey: resp.oneTimePrekey ? oneTimePrekeyFromWire(resp.oneTimePrekey) : undefined,
+    identitySigningPublicKey: base64ToBytesOrEmpty(resp.identitySigningPublicKey),
+    identityDhPublicKeySignature: base64ToBytesOrEmpty(resp.identityDhPublicKeySignature),
+  };
 }

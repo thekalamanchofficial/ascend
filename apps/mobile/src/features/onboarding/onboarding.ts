@@ -47,6 +47,19 @@ export interface OnboardingResult {
   displayName: string;
   sessionToken: string;
   expiresAtUnix: number;
+  /**
+   * This process's own registered Cryptography & Keys identity key handle
+   * (purpose "sign:identity") — added for Conversations' mobile client
+   * (conversations.charter.md §2/§5). Previously generated/restored here and
+   * silently discarded (never returned) — every crypto call Conversations'
+   * session-establishment orchestration needs (deriveSharedSecret,
+   * completeSharedSecret, and indirectly generatePrekeyBundle, which locates
+   * this same registered key by purpose) requires it. Same process-lifetime
+   * scoping caveat as `sessionToken`'s own device key: does not survive a
+   * cold app restart (crypto/keyRegistry.ts) — see this file's own
+   * already-disclosed "KNOWN GAP" comment above, not solved by this change.
+   */
+  identityPrivateKeyHandle: crypto.KeyHandle;
 }
 
 export interface CreateIdentityResult extends OnboardingResult {
@@ -162,8 +175,41 @@ function scheduleSessionRenewal(identityRef: string, deviceId: string, expiresAt
 export async function createIdentityFlow(request: {
   displayName: string;
   firstDeviceName: string;
+  /**
+   * Opt-in "bring your own phrase" path (2026-08-26, see
+   * docs/DECISION_LOG.md) — the default remains the zero-config path above
+   * (a fresh, CSPRNG-generated phrase via `generateIdentityKeyMaterial`),
+   * per Art. 13 "defaults are excellent, customization enhances, doesn't
+   * compensate." When supplied, this identity's root key is deterministically
+   * derived from the CALLER'S OWN phrase via `restoreFromRecoveryPhrase` —
+   * the same already-frozen, already-charter-gated primitive the restore-
+   * after-loss journey below uses, not new cryptographic surface. That
+   * function independently BIP-39-validates the phrase (wordlist + checksum)
+   * before deriving anything, so this is not an "accept arbitrary text as a
+   * root secret" path — it only accepts a genuinely valid BIP-39 mnemonic,
+   * generated wherever the user chooses to trust for their own root entropy
+   * (a real ownership feature for this platform's power-user target, not a
+   * security bypass: Crypto's charter §6 "no custom entropy pooling" bullet
+   * governs how THIS platform generates keys when it generates them itself;
+   * it does not, and cannot, police the entropy quality of a phrase a user
+   * deliberately supplies through an already-designed "restore" path, the
+   * same way a password manager cannot stop a user from choosing their own
+   * master password). The screen calling this is responsible for a clear,
+   * plain-language warning before this path is used — see
+   * CreateIdentityScreen.tsx.
+   */
+  customRecoveryPhrase?: string;
 }): Promise<CreateIdentityResult> {
-  const identityKeyMaterial = crypto.generateIdentityKeyMaterial({});
+  const identityKeyMaterial = request.customRecoveryPhrase
+    ? (() => {
+        const restored = crypto.restoreFromRecoveryPhrase({ recoveryPhrase: request.customRecoveryPhrase! });
+        return {
+          publicKey: restored.publicKey,
+          privateKeyHandle: restored.privateKeyHandle,
+          recoveryPhrase: request.customRecoveryPhrase!,
+        };
+      })()
+    : crypto.generateIdentityKeyMaterial({});
   const deviceKeyPair = crypto.generateKeyPair({ purpose: DEVICE_KEY_PURPOSE });
 
   const created = await identity.createIdentity({
@@ -186,6 +232,9 @@ export async function createIdentityFlow(request: {
   logAuditEvent("onboarding_identity_created", {
     identityRef: localRecord.identityRef,
     deviceId: localRecord.deviceId,
+    // Never the phrase itself — a boolean flag only, so which path was
+    // taken is explainable (Art. 5) without collecting anything sensitive.
+    recoveryPhraseSource: request.customRecoveryPhrase ? "user_supplied" : "generated",
   });
 
   return {
@@ -195,6 +244,7 @@ export async function createIdentityFlow(request: {
     displayName: localRecord.displayName,
     sessionToken: session.sessionToken,
     expiresAtUnix: session.expiresAtUnix,
+    identityPrivateKeyHandle: identityKeyMaterial.privateKeyHandle,
     recoveryPhrase: identityKeyMaterial.recoveryPhrase,
   };
 }
@@ -267,6 +317,7 @@ export async function restoreIdentityFlow(request: {
     displayName: localRecord.displayName,
     sessionToken: session.sessionToken,
     expiresAtUnix: session.expiresAtUnix,
+    identityPrivateKeyHandle: restored.privateKeyHandle,
   };
 }
 

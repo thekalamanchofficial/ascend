@@ -49,7 +49,7 @@ func (f *fakeAuditEmitter) actions() []string {
 
 func newTestService() (*Service, *fakeAuditEmitter) {
 	emitter := &fakeAuditEmitter{}
-	svc := NewService(NewInMemoryStore(), emitter)
+	svc := NewService(NewInMemoryStore(), NewInMemoryPrekeyStore(), emitter)
 	return svc, emitter
 }
 
@@ -463,7 +463,7 @@ func TestResolveIdentity_NotFound(t *testing.T) {
 // NoopAuditEmitter must fail loudly, never silently, if a caller forgets
 // to wire a real emitter — Art. 5 must not degrade into a silent no-op.
 func TestNoopAuditEmitter_FailsLoudly(t *testing.T) {
-	svc := NewService(NewInMemoryStore(), nil)
+	svc := NewService(NewInMemoryStore(), NewInMemoryPrekeyStore(), nil)
 	pub, _ := mustGenerateKey(t)
 	_, err := svc.CreateIdentity(CreateIdentityRequest{
 		DisplayName: "No Audit", PublicKey: pub,
@@ -471,5 +471,461 @@ func TestNoopAuditEmitter_FailsLoudly(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error when no AuditEmitter is configured, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prekey bundle publish/fetch (charter §3/§4/§6, amendment gated
+// 2026-08-20). Unit tests against InMemoryPrekeyStore — the real
+// concurrency requirement (charter §6/§7) is tested separately against a
+// live Postgres instance, see postgres_prekey_store_test.go.
+// ---------------------------------------------------------------------------
+
+func testSignedPrekey(id string) SignedPrekey {
+	return SignedPrekey{
+		PrekeyID:      id,
+		PublicKey:     []byte{0x01, 0x02, 0x03},
+		Signature:     []byte{0xAA, 0xBB, 0xCC, 0xDD},
+		CreatedAtUnix: 1_700_000_000,
+	}
+}
+
+// testDhKeyMaterial returns deterministic, distinguishable
+// identity_dh_public_key/identity_dh_public_key_signature test bytes
+// (key-separation fix, charter §3/§6) — this package never generates or
+// verifies real signatures for these values (pure storage/relay), so
+// plain tagged bytes are sufficient and let assertions confirm the exact
+// bytes round-tripped rather than merely "some bytes came back".
+func testDhKeyMaterial(id string) (identityDhPublicKey, identityDhPublicKeySignature []byte) {
+	return []byte("dh-pub-" + id), []byte("dh-sig-" + id)
+}
+
+func TestPublishPrekeyBundle_HappyPath_ReplacesSignedPrekey_AdditiveOneTime(t *testing.T) {
+	svc, emitter := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+	deviceID := created.FirstDevice.DeviceID
+
+	dhPub, dhSig := testDhKeyMaterial(deviceID)
+
+	resp1, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+		IdentityRef:                  identityRef,
+		DeviceID:                     deviceID,
+		SignedPrekey:                 testSignedPrekey("spk-1"),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+		OneTimePrekeys: []OneTimePrekeyPublic{
+			{PrekeyID: "otp-1", PublicKey: []byte{1}},
+			{PrekeyID: "otp-2", PublicKey: []byte{2}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("first PublishPrekeyBundle: %v", err)
+	}
+	if resp1.PublishedCount != 2 {
+		t.Fatalf("expected published_count 2, got %d", resp1.PublishedCount)
+	}
+
+	// Rotation: a second publish call with a NEW signed prekey and one
+	// MORE one-time prekey must replace the signed prekey and additively
+	// append (never remove/replace) the existing pool (charter §3).
+	// identity_dh_public_key/signature are stable, non-rotating (charter
+	// §3) — republished with the SAME bytes here, as a real client would.
+	resp2, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+		IdentityRef:                  identityRef,
+		DeviceID:                     deviceID,
+		SignedPrekey:                 testSignedPrekey("spk-2"),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+		OneTimePrekeys: []OneTimePrekeyPublic{
+			{PrekeyID: "otp-3", PublicKey: []byte{3}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("second PublishPrekeyBundle: %v", err)
+	}
+	if resp2.PublishedCount != 1 {
+		t.Fatalf("expected published_count 1 on rotation call, got %d", resp2.PublishedCount)
+	}
+
+	current, currentDhPub, currentDhSig, found, err := svc.prekeys.GetSignedPrekey(identityRef, deviceID)
+	if err != nil || !found {
+		t.Fatalf("GetSignedPrekey: found=%v err=%v", found, err)
+	}
+	if current.PrekeyID != "spk-2" {
+		t.Fatalf("expected rotation to replace signed prekey with spk-2, got %q", current.PrekeyID)
+	}
+	if string(currentDhPub) != string(dhPub) || string(currentDhSig) != string(dhSig) {
+		t.Fatalf("expected identity_dh_public_key/signature to remain the stable, republished values across rotation")
+	}
+
+	count, err := svc.prekeys.CountUnconsumedOneTimePrekeys(identityRef, deviceID)
+	if err != nil {
+		t.Fatalf("CountUnconsumedOneTimePrekeys: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 one-time prekeys still available (additive across both calls), got %d", count)
+	}
+
+	found = false
+	for _, a := range emitter.actions() {
+		if a == "identity.prekey_bundle_published" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an identity.prekey_bundle_published audit event; got actions %v", emitter.actions())
+	}
+}
+
+func TestPublishPrekeyBundle_ValidationErrors(t *testing.T) {
+	svc, _ := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+	deviceID := created.FirstDevice.DeviceID
+
+	dhPub, dhSig := testDhKeyMaterial("valid")
+
+	cases := []PublishPrekeyBundleRequest{
+		{IdentityRef: "", DeviceID: deviceID, SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: dhSig},
+		{IdentityRef: identityRef, DeviceID: "", SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: dhSig},
+		{IdentityRef: identityRef, DeviceID: deviceID, SignedPrekey: SignedPrekey{}, IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: dhSig},
+		// identity_dh_public_key/identity_dh_public_key_signature required,
+		// key-separation fix (charter §3) — same discipline as signed_prekey
+		// above, exercised as its own two cases.
+		{IdentityRef: identityRef, DeviceID: deviceID, SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: nil, IdentityDhPublicKeySignature: dhSig},
+		{IdentityRef: identityRef, DeviceID: deviceID, SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: nil},
+		{IdentityRef: identityRef, DeviceID: deviceID, SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: dhSig, OneTimePrekeys: []OneTimePrekeyPublic{{PrekeyID: "", PublicKey: []byte{1}}}},
+		{IdentityRef: identityRef, DeviceID: deviceID, SignedPrekey: testSignedPrekey("x"), IdentityDhPublicKey: dhPub, IdentityDhPublicKeySignature: dhSig, OneTimePrekeys: []OneTimePrekeyPublic{{PrekeyID: "p", PublicKey: nil}}},
+	}
+	for i, c := range cases {
+		if _, err := svc.PublishPrekeyBundle(c); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("case %d: expected ErrInvalidArgument, got %v", i, err)
+		}
+	}
+}
+
+// A device_id not actually bound to identity_ref must be rejected — this
+// is the caller-binding defense-in-depth check PublishPrekeyBundle
+// performs independently of the HTTP-layer device-binding middleware
+// (charter §6).
+func TestPublishPrekeyBundle_UnknownDevice(t *testing.T) {
+	svc, _ := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+
+	dhPub, dhSig := testDhKeyMaterial("unknown-device")
+	_, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+		IdentityRef:                  created.PublicIdentity.IdentityRef,
+		DeviceID:                     "not-a-real-device",
+		SignedPrekey:                 testSignedPrekey("x"),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+	})
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("expected ErrDeviceNotFound, got %v", err)
+	}
+}
+
+// The core enumeration-oracle closure requirement (charter §3/§6, Security
+// Steward gate finding round 1): "device never published a bundle",
+// "device_id not bound to identity_ref at all", AND (key-separation fix,
+// same section) "a signed prekey was published but its
+// identity_dh_public_key/identity_dh_public_key_signature pair is
+// missing" must all produce a byte-for-byte identical
+// FetchPrekeyBundleResponse. Compared via json.Marshal, not just
+// reflect.DeepEqual on the Go struct, to actually prove the wire bytes —
+// what a real caller observes — are identical, not merely the in-memory
+// value.
+func TestFetchPrekeyBundle_NeverPublishedAndUnboundDevice_ByteIdenticalResponses(t *testing.T) {
+	svc, _ := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+	realDeviceID := created.FirstDevice.DeviceID // real, bound, but has never published
+
+	neverPublishedResp, err := svc.FetchPrekeyBundle("some-fetcher", FetchPrekeyBundleRequest{
+		IdentityRef: identityRef,
+		DeviceID:    realDeviceID,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrekeyBundle (never published): %v", err)
+	}
+	unboundResp, err := svc.FetchPrekeyBundle("some-fetcher", FetchPrekeyBundleRequest{
+		IdentityRef: identityRef,
+		DeviceID:    "device-that-does-not-exist-at-all",
+	})
+	if err != nil {
+		t.Fatalf("FetchPrekeyBundle (unbound device_id): %v", err)
+	}
+
+	if neverPublishedResp.Status != PrekeyBundleStatusNotPublished {
+		t.Fatalf("expected NOT_PUBLISHED for never-published device, got %v", neverPublishedResp.Status)
+	}
+	if unboundResp.Status != PrekeyBundleStatusNotPublished {
+		t.Fatalf("expected NOT_PUBLISHED for unbound device_id, got %v", unboundResp.Status)
+	}
+
+	neverPublishedJSON, err := json.Marshal(neverPublishedResp)
+	if err != nil {
+		t.Fatalf("marshal neverPublishedResp: %v", err)
+	}
+	unboundJSON, err := json.Marshal(unboundResp)
+	if err != nil {
+		t.Fatalf("marshal unboundResp: %v", err)
+	}
+	if string(neverPublishedJSON) != string(unboundJSON) {
+		t.Fatalf("responses are NOT byte-for-byte identical (enumeration oracle reopened):\n  never-published: %s\n  unbound device:  %s", neverPublishedJSON, unboundJSON)
+	}
+
+	// Key-separation fix's own fail-closed case: a device with a genuinely
+	// published signed_prekey but an EMPTY identity_dh_public_key/signature
+	// pair — constructed by calling the store directly (bypassing
+	// Service.PublishPrekeyBundle's own request validation, which would
+	// reject empty DH bytes before ever reaching the store; this is the
+	// only way to produce this state at all) — must be indistinguishable
+	// from both cases above.
+	created2, _, _ := createTestIdentity(t, svc)
+	identityRef2 := created2.PublicIdentity.IdentityRef
+	deviceID2 := created2.FirstDevice.DeviceID
+	if _, err := svc.prekeys.PublishBundle(identityRef2, deviceID2, testSignedPrekey("spk-missing-dh"), nil, nil, nil); err != nil {
+		t.Fatalf("PublishBundle (bypassing service validation) with empty DH pair: %v", err)
+	}
+	missingDhResp, err := svc.FetchPrekeyBundle("some-fetcher", FetchPrekeyBundleRequest{
+		IdentityRef: identityRef2,
+		DeviceID:    deviceID2,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrekeyBundle (missing DH pair): %v", err)
+	}
+	if missingDhResp.Status != PrekeyBundleStatusNotPublished {
+		t.Fatalf("expected NOT_PUBLISHED when identity_dh_public_key/signature are missing (fail-closed), got %v", missingDhResp.Status)
+	}
+	missingDhJSON, err := json.Marshal(missingDhResp)
+	if err != nil {
+		t.Fatalf("marshal missingDhResp: %v", err)
+	}
+	if string(missingDhJSON) != string(neverPublishedJSON) {
+		t.Fatalf("missing-DH-pair response is NOT byte-for-byte identical to never-published (fail-closed enumeration oracle reopened):\n  missing DH pair: %s\n  never-published: %s", missingDhJSON, neverPublishedJSON)
+	}
+}
+
+func TestFetchPrekeyBundle_UnknownIdentityRef_IsARealError(t *testing.T) {
+	svc, _ := newTestService()
+	_, err := svc.FetchPrekeyBundle("some-fetcher", FetchPrekeyBundleRequest{IdentityRef: "does-not-exist"})
+	if !errors.Is(err, ErrIdentityNotFound) {
+		t.Fatalf("expected ErrIdentityNotFound for an unknown identity_ref, got %v", err)
+	}
+}
+
+// A successful fetch that consumes a one-time prekey must emit an audit
+// event with the FETCHER as actor (charter §4), never the target's own
+// identity_ref, and never any key bytes in metadata.
+func TestFetchPrekeyBundle_ConsumesOneTimePrekey_AuditsFetcherAsActor(t *testing.T) {
+	svc, emitter := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+	deviceID := created.FirstDevice.DeviceID
+
+	dhPub, dhSig := testDhKeyMaterial(deviceID)
+	if _, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+		IdentityRef:                  identityRef,
+		DeviceID:                     deviceID,
+		SignedPrekey:                 testSignedPrekey("spk-1"),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+		OneTimePrekeys:               []OneTimePrekeyPublic{{PrekeyID: "otp-1", PublicKey: []byte{9}}},
+	}); err != nil {
+		t.Fatalf("PublishPrekeyBundle: %v", err)
+	}
+
+	fetchResp, err := svc.FetchPrekeyBundle("fetcher-identity-ref", FetchPrekeyBundleRequest{
+		IdentityRef: identityRef,
+		DeviceID:    deviceID,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrekeyBundle: %v", err)
+	}
+	if fetchResp.Status != PrekeyBundleStatusAvailable {
+		t.Fatalf("expected AVAILABLE, got %v", fetchResp.Status)
+	}
+	if fetchResp.OneTimePrekey == nil || fetchResp.OneTimePrekey.PrekeyID != "otp-1" {
+		t.Fatalf("expected one_time_prekey otp-1 in response, got %+v", fetchResp.OneTimePrekey)
+	}
+	if fetchResp.SignedPrekey.PrekeyID != "spk-1" {
+		t.Fatalf("unexpected signed_prekey in response: %+v", fetchResp.SignedPrekey)
+	}
+	// identity_dh_public_key/signature (key-separation fix): the DEVICE's
+	// stored DH key/signature, NEVER the identity's Ed25519 signing key.
+	if string(fetchResp.IdentityDhPublicKey) != string(dhPub) {
+		t.Fatalf("identity_dh_public_key mismatch: got %q, want %q", fetchResp.IdentityDhPublicKey, dhPub)
+	}
+	if string(fetchResp.IdentityDhPublicKeySignature) != string(dhSig) {
+		t.Fatalf("identity_dh_public_key_signature mismatch: got %q, want %q", fetchResp.IdentityDhPublicKeySignature, dhSig)
+	}
+	// identity_signing_public_key (proto field 6, NEW): sourced from the
+	// identity record itself — the same value ResolveIdentity returns —
+	// and genuinely distinct from identity_dh_public_key above.
+	if string(fetchResp.IdentitySigningPublicKey) != string(created.PublicIdentity.PublicKey) {
+		t.Fatalf("identity_signing_public_key mismatch")
+	}
+	if string(fetchResp.IdentitySigningPublicKey) == string(fetchResp.IdentityDhPublicKey) {
+		t.Fatalf("identity_signing_public_key and identity_dh_public_key must never be the same bytes")
+	}
+
+	var consumeEvent *fakeAuditEvent
+	for i := range emitter.events {
+		if emitter.events[i].Action == "identity.prekey_bundle_fetched" {
+			consumeEvent = &emitter.events[i]
+		}
+	}
+	if consumeEvent == nil {
+		t.Fatalf("expected an identity.prekey_bundle_fetched audit event; got actions %v", emitter.actions())
+	}
+	if consumeEvent.Actor != "fetcher-identity-ref" {
+		t.Errorf("expected actor to be the fetcher, got %q", consumeEvent.Actor)
+	}
+	for k, v := range consumeEvent.Metadata {
+		if k == "identity_ref" || k == "device_id" || k == "one_time_prekey_id_consumed" {
+			continue
+		}
+		t.Errorf("unexpected audit metadata key %q=%q — only identifiers/counts are permitted, never key bytes", k, v)
+	}
+
+	// The pool is now empty — a second fetch must hit the exhaustion
+	// fallback (AVAILABLE, but no one_time_prekey, and no second consuming
+	// audit event).
+	eventsBefore := len(emitter.events)
+	secondFetch, err := svc.FetchPrekeyBundle("fetcher-identity-ref", FetchPrekeyBundleRequest{
+		IdentityRef: identityRef,
+		DeviceID:    deviceID,
+	})
+	if err != nil {
+		t.Fatalf("second FetchPrekeyBundle: %v", err)
+	}
+	if secondFetch.Status != PrekeyBundleStatusAvailable {
+		t.Fatalf("expected AVAILABLE even when the one-time-prekey pool is exhausted, got %v", secondFetch.Status)
+	}
+	if secondFetch.OneTimePrekey != nil {
+		t.Fatalf("expected no one_time_prekey once the pool is exhausted, got %+v", secondFetch.OneTimePrekey)
+	}
+	if len(emitter.events) != eventsBefore {
+		t.Errorf("exhaustion-fallback fetch must not emit a new audit event; event count went from %d to %d", eventsBefore, len(emitter.events))
+	}
+}
+
+// device_id omitted resolves to the identity's most-recently-active bound
+// device, by last_seen_unix (charter §3).
+func TestFetchPrekeyBundle_DefaultsToMostRecentlyActiveDevice(t *testing.T) {
+	svc, _ := newTestService()
+	created, _, firstDevicePriv := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+
+	// Bind a second device — InMemoryStore sets LastSeenUnix to "now" at
+	// bind time for both devices, and BindDevice runs strictly after
+	// CreateIdentity, so the second device is (at worst, tied but
+	// deterministically) at least as recently seen. To make the ordering
+	// unambiguous regardless of clock resolution, publish bundles for BOTH
+	// devices and assert the response targets the SECOND (most recently
+	// bound/seen) device specifically.
+	secondPub, _ := mustGenerateKey(t)
+	message := buildDeviceBindingMessage(identityRef, secondPub, "Second Device", created.PublicIdentity.Epoch)
+	proof := ed25519.Sign(firstDevicePriv, message)
+	bindResp, err := svc.BindDevice(BindDeviceRequest{
+		IdentityRef: identityRef, DevicePublicKey: secondPub,
+		DeviceName: "Second Device", AuthorizationProof: proof,
+	})
+	if err != nil {
+		t.Fatalf("BindDevice: %v", err)
+	}
+
+	// Force an unambiguous last-seen ordering directly against the store,
+	// since both devices may share a last_seen_unix value from the same
+	// wall-clock second in a fast-running test.
+	record, err := svc.store.Get(identityRef)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	for i := range record.Devices {
+		if record.Devices[i].DeviceID == created.FirstDevice.DeviceID {
+			record.Devices[i].LastSeenUnix = 1000
+		} else {
+			record.Devices[i].LastSeenUnix = 2000
+		}
+	}
+	if err := svc.store.Replace(record); err != nil {
+		t.Fatalf("store.Replace: %v", err)
+	}
+
+	for _, deviceID := range []string{created.FirstDevice.DeviceID, bindResp.Device.DeviceID} {
+		dhPub, dhSig := testDhKeyMaterial(deviceID)
+		if _, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+			IdentityRef:                  identityRef,
+			DeviceID:                     deviceID,
+			SignedPrekey:                 testSignedPrekey("spk-" + deviceID),
+			IdentityDhPublicKey:          dhPub,
+			IdentityDhPublicKeySignature: dhSig,
+		}); err != nil {
+			t.Fatalf("PublishPrekeyBundle for %s: %v", deviceID, err)
+		}
+	}
+
+	resp, err := svc.FetchPrekeyBundle("fetcher", FetchPrekeyBundleRequest{IdentityRef: identityRef}) // device_id omitted
+	if err != nil {
+		t.Fatalf("FetchPrekeyBundle: %v", err)
+	}
+	if resp.DeviceID != bindResp.Device.DeviceID {
+		t.Fatalf("expected default resolution to pick the most-recently-active device %q, got %q", bindResp.Device.DeviceID, resp.DeviceID)
+	}
+}
+
+// ListDevices' unconsumed_one_time_prekey_count (charter §4/§6) must
+// reflect the real, current pool size, and must NOT itself be a stale
+// persisted value (types.go's Device doc comment).
+func TestListDevices_UnconsumedOneTimePrekeyCount(t *testing.T) {
+	svc, _ := newTestService()
+	created, _, _ := createTestIdentity(t, svc)
+	identityRef := created.PublicIdentity.IdentityRef
+	deviceID := created.FirstDevice.DeviceID
+
+	listResp, err := svc.ListDevices(ListDevicesRequest{IdentityRef: identityRef})
+	if err != nil {
+		t.Fatalf("ListDevices: %v", err)
+	}
+	if listResp.Devices[0].UnconsumedOneTimePrekeyCount != 0 {
+		t.Fatalf("expected 0 unconsumed one-time prekeys before any publish, got %d", listResp.Devices[0].UnconsumedOneTimePrekeyCount)
+	}
+
+	dhPub, dhSig := testDhKeyMaterial(deviceID)
+	if _, err := svc.PublishPrekeyBundle(PublishPrekeyBundleRequest{
+		IdentityRef:                  identityRef,
+		DeviceID:                     deviceID,
+		SignedPrekey:                 testSignedPrekey("spk-1"),
+		IdentityDhPublicKey:          dhPub,
+		IdentityDhPublicKeySignature: dhSig,
+		OneTimePrekeys: []OneTimePrekeyPublic{
+			{PrekeyID: "otp-1", PublicKey: []byte{1}},
+			{PrekeyID: "otp-2", PublicKey: []byte{2}},
+		},
+	}); err != nil {
+		t.Fatalf("PublishPrekeyBundle: %v", err)
+	}
+
+	listResp, err = svc.ListDevices(ListDevicesRequest{IdentityRef: identityRef})
+	if err != nil {
+		t.Fatalf("ListDevices after publish: %v", err)
+	}
+	if listResp.Devices[0].UnconsumedOneTimePrekeyCount != 2 {
+		t.Fatalf("expected 2 unconsumed one-time prekeys after publish, got %d", listResp.Devices[0].UnconsumedOneTimePrekeyCount)
+	}
+
+	if _, err := svc.FetchPrekeyBundle("fetcher", FetchPrekeyBundleRequest{IdentityRef: identityRef, DeviceID: deviceID}); err != nil {
+		t.Fatalf("FetchPrekeyBundle: %v", err)
+	}
+
+	listResp, err = svc.ListDevices(ListDevicesRequest{IdentityRef: identityRef})
+	if err != nil {
+		t.Fatalf("ListDevices after fetch: %v", err)
+	}
+	if listResp.Devices[0].UnconsumedOneTimePrekeyCount != 1 {
+		t.Fatalf("expected 1 unconsumed one-time prekey after one fetch consumed one, got %d", listResp.Devices[0].UnconsumedOneTimePrekeyCount)
 	}
 }

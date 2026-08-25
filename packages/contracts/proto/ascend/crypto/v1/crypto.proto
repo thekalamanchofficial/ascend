@@ -57,10 +57,110 @@ service CryptoService {
   // "Signature verification is not 'own crypto'").
   rpc Sign(SignRequest) returns (SignResponse);
 
-  // Session/channel key agreement. Implementation must provide forward
-  // secrecy and post-compromise security (charter §6) — construction choice
-  // (e.g. double ratchet) is left to the capability engineer.
+  // Session/channel key agreement — the INITIATING party's half. Implementation
+  // must provide forward secrecy and post-compromise security (charter §6).
+  //
+  // AMENDED 2026-08-20 (responder-side prekey completion — see
+  // docs/capabilities/cryptography-and-keys.charter.md §3/§6/§7, gated
+  // 2026-08-19, and docs/DECISION_LOG.md's 2026-08-19/20 entries for the
+  // full veto-and-fix history): signature changed from a bare
+  // `remote_public_key` to `their_prekey_bundle` (a real, fetched
+  // SignedPrekey + optional OneTimePrekeyPublic) — a bare public key alone
+  // cannot provide the responder-side forward secrecy this amendment adds.
+  // The exact derivation is a REQUIRED, charter-specified standard X3DH
+  // four-term construction (charter §3) — NOT an implementation-discretion
+  // item the way cipher-suite choice is (§7): DH1=DH(IK_A,SPK_B),
+  // DH2=DH(EK_A,IK_B), DH3=DH(EK_A,SPK_B), DH4=DH(EK_A,OPK_B) when a
+  // one-time prekey was used; shared_secret=HKDF(DH1||DH2||DH3[||DH4],
+  // context) with a fixed, distinct context literal per case (with-OTP vs.
+  // signed-prekey-only) for required domain separation. This explicitly
+  // SUPERSEDES the prior two-term (`staticStaticDh`+`ephemeralStaticDh`)
+  // construction in apps/mobile/src/capabilities/crypto/ratchet.ts, not a
+  // reparameterization of it.
   rpc DeriveSharedSecret(DeriveSharedSecretRequest) returns (DeriveSharedSecretResponse);
+
+  // Session/channel key agreement — the RESPONDING party's half. Added
+  // 2026-08-20, structurally absent before this amendment (Conversations'
+  // charter named this as its hard blocking prerequisite). Looks up the
+  // referenced local private prekey material (stored by
+  // GeneratePrekeyBundle) and performs the responder's side of the
+  // identical derivation DeriveSharedSecret specifies above, arriving at
+  // the same shared_secret.
+  //
+  // FORWARD-SECRECY-CRITICAL, hard requirement, not an implementation
+  // nicety (charter §6): the referenced one-time prekey's private key MUST
+  // be atomically consumed and permanently deleted — a single atomic
+  // operation (e.g. an in-process per-prekey_id mutex around the
+  // SecureLocalStore lookup+delete; React Native's single-threaded JS
+  // execution makes this sufficient, scoped to one JS runtime instance —
+  // see charter §7 items 5/6 for named, non-blocking residual risks:
+  // cross-JS-context invocation, crash-mid-consumption durability), never a
+  // separate read-then-delete. A losing concurrent call for an
+  // already-consumed my_one_time_prekey_id must fail with a specific,
+  // distinguishable error, never silently succeed or hang.
+  //
+  // If my_one_time_prekey_id is omitted (exhaustion-fallback — charter §6),
+  // the resulting session has a stated, disclosed weaker guarantee and this
+  // call must emit the required session_established_signed_prekey_only
+  // audit event (charter §6). Signed-prekey signature verification failure
+  // is a hard abort (no partial derivation) plus a required
+  // signed_prekey_signature_invalid audit event — never a silent fallback.
+  //
+  // ALSO REQUIRED, restated here at the RPC level (2026-08-21, round 6,
+  // Security Steward gate finding: this requirement previously lived only
+  // in the field-2 comment on CompleteSharedSecretRequest, not restated
+  // here where a reader of the RPC summary would expect to find every
+  // hard-abort obligation this call carries): their_identity_dh_public_key
+  // MUST be verified against their_identity_signing_public_key via
+  // their_identity_dh_public_key_signature before use in any DH term —
+  // hard abort, reusing signed_prekey_signature_invalid, never skipped.
+  // This closes wholesale key fabrication (charter §6) — a distinct,
+  // more severe threat than field-tampering, not covered by the
+  // DH-term-isolation reasoning that governs signed_prekey/
+  // identity_dh_public_key substitution above.
+  rpc CompleteSharedSecret(CompleteSharedSecretRequest) returns (CompleteSharedSecretResponse);
+
+  // Generates a fresh medium-term signed prekey (its public key signed by
+  // the identity's long-term signing key) plus one_time_prekey_count fresh
+  // single-use one-time prekeys. Added 2026-08-20, same amendment. All
+  // private halves stay local via SecureLocalStore, indexed by prekey_id;
+  // only public halves + signature are returned, for whatever capability
+  // publishes per-identity/per-device public key material on this device's
+  // behalf (this capability has no network component of its own — see
+  // Identity's own companion amendment,
+  // docs/capabilities/identity.charter.md §3, gated 2026-08-20). Must be
+  // called periodically (signed-prekey rotation, one-time-prekey
+  // replenishment) — exact cadence is an implementation decision (charter
+  // §7), not specified here. Generation/rotation/replenishment must be
+  // fully invisible, automatic background maintenance (charter §5) — no
+  // user action, no user awareness required for the routine case.
+  rpc GeneratePrekeyBundle(GeneratePrekeyBundleRequest) returns (GeneratePrekeyBundleResponse);
+
+  // EncryptMessage/DecryptMessage — added 2026-08-23, "the ongoing-ratchet
+  // exposure gap" amendment (charter §3/§6/§7). The first functions in this
+  // capability's public contract to actually consume a shared_secret_handle
+  // for real message content: DeriveSharedSecret/CompleteSharedSecret only
+  // ever established a session before this amendment. ciphertext is a
+  // single, self-describing, versioned opaque byte string — Conversations
+  // relays it byte-for-byte and never interprets it, no wire-contract
+  // change needed on that capability's side. Session state (RatchetState)
+  // is persisted via SecureLocalStore, keyed by shared_secret_handle, not
+  // held only in the in-process key registry (charter §3's persistence
+  // fix) — required so an ordinary app backgrounding/relaunch does not
+  // silently destroy an active conversation's session. A per-
+  // shared_secret_handle mutex serializes concurrent calls (charter §6),
+  // mirroring CompleteSharedSecret's own one-time-prekey mutex pattern.
+  // AEAD nonce generation is randomized per call, required, not an
+  // implementation choice (charter §3). Neither RPC emits a per-message
+  // audit event, a deliberate charter decision (§3, Art. 8 volume/
+  // minimization reasoning) — session establishment remains the audited
+  // lifecycle event (shared_secret_derived, etc.), not per-message
+  // traffic on an already-established session. This amendment delivers
+  // forward secrecy for the message chain but NOT post-compromise
+  // security (no periodic DH-ratchet step) — a named, disclosed,
+  // Chief-Architect-accepted gap (charter §6/§7), not silently omitted.
+  rpc EncryptMessage(EncryptMessageRequest) returns (EncryptMessageResponse);
+  rpc DecryptMessage(DecryptMessageRequest) returns (DecryptMessageResponse);
 
   // Encrypted local storage wrapper other capabilities use instead of
   // hand-rolling their own at-rest encryption.
@@ -133,13 +233,171 @@ message DecryptResponse {
   bytes plaintext = 1;
 }
 
+// A responder's published medium-term prekey, signed by the identity's
+// long-term signing key (charter §6 "Signed-prekey substitution" —
+// verification of this signature before use is required, not optional; a
+// verification failure is a hard abort, see CompleteSharedSecret above).
+message SignedPrekey {
+  string prekey_id = 1;
+  bytes public_key = 2;
+  bytes signature = 3;
+  int64 created_at_unix = 4;
+}
+
+// A responder's published single-use prekey. Consuming one (via
+// CompleteSharedSecret) permanently deletes its private half — this is the
+// term that provides responder-side forward secrecy (charter §6).
+message OneTimePrekeyPublic {
+  string prekey_id = 1;
+  bytes public_key = 2;
+}
+
+// What an initiator fetches (from wherever it's published — Identity's own
+// companion amendment, not this capability) before calling
+// DeriveSharedSecret. one_time_prekey absent means the exhaustion-fallback
+// case (charter §6) — DeriveSharedSecret must still succeed, with the
+// stated weaker guarantee.
+//
+// identity_dh_public_key/its signature moved INTO this bundle, 2026-08-21
+// (Security Steward implementation-gate finding on the key-separation fix
+// itself, round 2): the responder's DH-capable identity key is
+// server-published/-fetched material, exactly like signed_prekey, and so
+// needs the identical signature-verification discipline — it must not be
+// trusted as a bare, unsigned value a compromised server could substitute.
+message PrekeyBundle {
+  // The responder's X25519 DH-capable identity public key (charter §3's
+  // "IK_A/IK_B MUST be a genuinely separate, DH-only key" requirement) —
+  // NEVER the Ed25519 signing key. Verified against
+  // DeriveSharedSecretRequest.their_identity_signing_public_key via
+  // identity_dh_public_key_signature before use in any DH term — hard
+  // abort on failure, the same discipline signed_prekey's own signature
+  // already requires.
+  bytes identity_dh_public_key = 1;
+  bytes identity_dh_public_key_signature = 2;
+  SignedPrekey signed_prekey = 3;
+  optional OneTimePrekeyPublic one_time_prekey = 4;
+}
+
 message DeriveSharedSecretRequest {
   KeyHandle private_key_handle = 1;
-  bytes remote_public_key = 2;
+  // The responder's Ed25519 SIGNING public key — NOT DH-capable, and
+  // genuinely distinct from their_prekey_bundle.identity_dh_public_key.
+  // This is the trusted verification anchor for BOTH
+  // their_prekey_bundle.signed_prekey.signature AND
+  // their_prekey_bundle.identity_dh_public_key_signature. Sourced from
+  // Identity's ResolveIdentity — the same value that RPC has always
+  // returned, unchanged by the 2026-08-21 key-separation fix. (Field
+  // corrected 2026-08-21: an earlier pass renamed this field to
+  // their_identity_dh_public_key, which broke signature verification —
+  // the verification anchor and the DH-capable key are two different
+  // keys and must never be the same wire field again.)
+  bytes their_identity_signing_public_key = 2;
+  PrekeyBundle their_prekey_bundle = 3;
 }
 
 message DeriveSharedSecretResponse {
   KeyHandle shared_secret_handle = 1;
+  // The caller's own freshly generated, single-use ephemeral public key —
+  // the caller's transport layer (e.g. Conversations'
+  // session_establishment_payload) carries this to the responder. This
+  // capability has no transport of its own (charter §3).
+  bytes my_ephemeral_public_key = 2;
+}
+
+message CompleteSharedSecretRequest {
+  KeyHandle private_key_handle = 1;
+  // The INITIATOR's X25519 DH-capable identity key — carried in
+  // Conversations' session_establishment_payload (charter §7 item 4).
+  // MUST be verified against their_identity_signing_public_key via
+  // their_identity_dh_public_key_signature before use in any DH term —
+  // required, added 2026-08-21, round 4 (Security Steward gate finding: a
+  // distinct threat the DH-term-isolation argument does NOT cover — an
+  // attacker who fabricates BOTH their_identity_dh_public_key and
+  // their_ephemeral_public_key wholesale, rather than tampering with one
+  // field of an otherwise-genuine handshake, holds 100% of the private
+  // material every DH term needs and can derive a fully working shared
+  // secret the responder will accept as belonging to whatever identity
+  // the fabricated key is presented as — this is "minting a valid key on
+  // a user's behalf" under a compromised relay, exactly what charter §6's
+  // pre-existing server-compromise line already forbids, not merely a
+  // derivation mismatch). A prior version of this comment argued no
+  // signature was needed here on DH-term-isolation grounds — that
+  // argument is correct for in-flight tampering of a genuine handshake,
+  // but does not extend to wholesale fabrication, which is a different
+  // threat this hard-abort verification step closes.
+  bytes their_identity_dh_public_key = 2;
+  bytes their_ephemeral_public_key = 3;
+  string my_signed_prekey_id = 4;
+  // Absent means the exhaustion-fallback case (charter §6) — this call
+  // still succeeds with a stated weaker guarantee, and must emit the
+  // required session_established_signed_prekey_only audit event.
+  optional string my_one_time_prekey_id = 5;
+  // Added 2026-08-21, round 4, same finding. The claimed sender's Ed25519
+  // signing public key — sourced by the caller via Identity's
+  // ResolveIdentity(sender_identity_ref) (already-existing RPC, no
+  // Identity contract change needed; Conversations' own message envelope
+  // already carries sender's identity_ref, so this composition needs no
+  // new lookup path). The trusted verification anchor for
+  // their_identity_dh_public_key_signature below.
+  bytes their_identity_signing_public_key = 6;
+  // The initiator's own signature over their_identity_dh_public_key
+  // (their own GeneratePrekeyBundleResponse.identity_dh_public_key_signature,
+  // cached locally and included directly in session_establishment_payload
+  // — no network round-trip needed to construct it). Verified against
+  // their_identity_signing_public_key; hard abort on failure (reusing
+  // signed_prekey_signature_invalid, charter §6), never a silent
+  // fallback — the same discipline every other signature check in this
+  // contract already receives.
+  bytes their_identity_dh_public_key_signature = 7;
+}
+
+message CompleteSharedSecretResponse {
+  KeyHandle shared_secret_handle = 1;
+}
+
+// EncryptMessage/DecryptMessage — "the ongoing-ratchet exposure gap"
+// amendment, 2026-08-23. plaintext/ciphertext never cross this capability's
+// own boundary in the other direction (plaintext never leaves the device,
+// ciphertext is the only thing a caller ever relays onward).
+message EncryptMessageRequest {
+  KeyHandle shared_secret_handle = 1;
+  bytes plaintext = 2;
+}
+
+message EncryptMessageResponse {
+  bytes ciphertext = 1;
+}
+
+message DecryptMessageRequest {
+  KeyHandle shared_secret_handle = 1;
+  bytes ciphertext = 2;
+}
+
+message DecryptMessageResponse {
+  bytes plaintext = 1;
+}
+
+message GeneratePrekeyBundleRequest {
+  int32 one_time_prekey_count = 1;
+}
+
+message GeneratePrekeyBundleResponse {
+  // The device's X25519 DH-capable identity public key, deterministically
+  // derived from the same recovery-phrase seed as the Ed25519 signing key
+  // via a domain-separated KDF (charter §3) — genuinely different bytes
+  // from GenerateIdentityKeyMaterialResponse.public_key. The caller (or
+  // whatever publishes on this device's behalf) must pass this to
+  // Identity's PublishPrekeyBundle as identity_dh_public_key.
+  bytes identity_dh_public_key = 1;
+  SignedPrekey signed_prekey = 2;
+  repeated OneTimePrekeyPublic one_time_prekeys = 3;
+  // Signed with the SAME Ed25519 identity signing key that signs
+  // signed_prekey.signature, generated in this same call — required,
+  // 2026-08-21 (Security Steward finding: an unsigned identity_dh_public_key
+  // is a substitution surface a compromised publish/fetch path could
+  // exploit, even though the bounded impact is a derivation
+  // mismatch/undecryptable session, not a confidentiality break).
+  bytes identity_dh_public_key_signature = 4;
 }
 
 message SecureLocalStoreRequest {

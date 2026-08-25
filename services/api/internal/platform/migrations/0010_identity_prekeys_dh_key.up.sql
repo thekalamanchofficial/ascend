@@ -1,0 +1,65 @@
+-- 0010_identity_prekeys_dh_key: adds the two columns the key-separation fix
+-- requires (docs/capabilities/identity.charter.md §3/§6, cryptography-and-
+-- keys.charter.md §3, both amended 2026-08-21; identity.proto's
+-- PublishPrekeyBundleRequest fields 5/6 and FetchPrekeyBundleResponse
+-- fields 6/7 — see identity.proto's own comments on each for the full
+-- design-gate history, eight combined Constitution Warden/Security Steward
+-- rounds, docs/DECISION_LOG.md).
+--
+-- Both columns live on identity_signed_prekeys (0009_identity_prekeys.up.sql),
+-- NOT a new table: charter §3 states these are "stable, non-rotating"
+-- per-device values (a device's DH-capable identity key does not change
+-- the way its signed prekey does on each rotation), but PublishPrekeyBundle
+-- still republishes/upserts them on EVERY call alongside the rotatable
+-- signed-prekey fields — Identity cannot derive this value independently
+-- (identity.proto's own comment on PublishPrekeyBundleRequest field 5), so
+-- there is no way to populate it once and never touch it again. One row
+-- per (identity_ref, device_id), matching identity_signed_prekeys' own
+-- primary key exactly — no new key, no new rotation history, both values
+-- simply overwritten in place on every upsert (see
+-- postgres_prekey_store.go's PublishBundle for the exact statement).
+--
+-- NOT NULL. A publish call omitting either value is rejected at the
+-- application layer (service.go's PublishPrekeyBundle validation) before
+-- it would ever reach this constraint going forward — the NOT NULL
+-- constraint is defense-in-depth, not the only enforcement point.
+--
+-- The DELETE below is a real, live-confirmed correction, not a
+-- theoretical concern: this migration was first written assuming "no
+-- existing rows to backfill" (0009 was never deployed to production), but
+-- running it against this project's own shared local dev Postgres
+-- instance failed with a genuine `column "identity_dh_public_key" ...
+-- contains null values` error — 0009's own tests (postgres_prekey_store_test.go)
+-- had already left rows behind from prior runs (best-effort
+-- MIGRATIONS_DATABASE_URL-gated cleanup, not guaranteed, see that file's
+-- cleanupPrekeys doc comment). Clearing both prekey tables outright before
+-- adding the NOT NULL columns is safe specifically BECAUSE this state is
+-- exactly what 0009_identity_prekeys.up.sql's own doc comment already
+-- calls ephemeral, auto-regenerating routing infrastructure with no Art. 9
+-- export obligation ("a device that rejoins or a fresh device that binds
+-- simply regenerates and republishes on next launch") — this is not a
+-- migration technique that would be safe for any of this schema's other,
+-- genuinely durable tables (identities, audit_events, etc.).
+DELETE FROM identity_one_time_prekeys;
+DELETE FROM identity_signed_prekeys;
+--
+-- Fail-closed requirement (charter §3/§6): FetchPrekeyBundle must treat a
+-- device as PREKEY_BUNDLE_STATUS_NOT_PUBLISHED if EITHER signed_prekey OR
+-- this identity_dh_public_key/identity_dh_public_key_signature pair is
+-- missing. Because both columns live in the SAME row as signed_prekey's
+-- own public_key/signature columns (all NOT NULL, all written by the same
+-- single upsert statement), "the row exists" and "all five key/signature
+-- columns are populated" are the same fact by construction here — there is
+-- no schema-level way to end up with a signed prekey but no DH pair.
+-- postgres_prekey_store.go's GetSignedPrekey still checks the returned
+-- byte slices are non-empty before reporting found=true, as explicit,
+-- readable defense-in-depth rather than relying on this constraint alone
+-- (see that file's doc comment).
+ALTER TABLE identity_signed_prekeys
+    ADD COLUMN identity_dh_public_key BYTEA NOT NULL,
+    ADD COLUMN identity_dh_public_key_signature BYTEA NOT NULL;
+
+-- No new GRANT needed: identity_signed_prekeys already has
+-- `GRANT SELECT, INSERT, UPDATE ... TO ascend_app` from 0009 — a new
+-- column on an already-granted table needs no additional privilege grant
+-- in Postgres.

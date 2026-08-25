@@ -40,6 +40,41 @@ with the same purpose, on the server side; nothing here is new collection.
   device a gated request concerns. Not generated or interpreted by this
   module.
 
+- `signedPrekey` (`prekeyId`/`publicKey`/`signature`/`createdAtUnix`) /
+  `oneTimePrekeys[]` (`prekeyId`/`publicKey`)
+  (added 2026-08-20, prekey bundle publish/fetch amendment)
+  Purpose: already-public, already-signed bytes produced by Cryptography &
+  Keys' `generatePrekeyBundle` (private halves never pass through this
+  module — see that capability's own manifest). `publishPrekeyBundle`
+  sends these; `fetchPrekeyBundle` receives a `signedPrekey` and,
+  optionally, one `oneTimePrekey` back for a DIFFERENT identity's device.
+  This module base64-encodes/decodes but never generates, signs, or
+  inspects the key material itself.
+
+- `unconsumedOneTimePrekeyCount` (on `Device`, added 2026-08-20)
+  Purpose: same as the server-side manifest's entry of the same name — a
+  self-only, count-only passive signal, received via `listDevices`, never
+  sent by this module.
+
+- `identityDhPublicKey` / `identityDhPublicKeySignature`
+  (added 2026-08-21, key-separation fix)
+  Purpose: already-public, already-signed bytes produced by Cryptography &
+  Keys' `generatePrekeyBundle` (identically-named response fields; the
+  corresponding X25519 private key never passes through this module — see
+  that capability's own manifest). `publishPrekeyBundle` sends the calling
+  device's own values; `fetchPrekeyBundle` receives a DIFFERENT identity's
+  device's values back. Genuinely distinct from `publicKey` above (that is
+  the identity's Ed25519 *signing* key) — this module never conflates the
+  two, and never generates, signs, or verifies either value itself.
+
+- `identitySigningPublicKey` (on `FetchPrekeyBundleResponse`, added
+  2026-08-21, same fix)
+  Purpose: the target identity's Ed25519 signing public key, received via
+  `fetchPrekeyBundle` so a caller can verify `signedPrekey`/
+  `identityDhPublicKey`'s signatures without a second `resolveIdentity`
+  round trip. Identical in kind to `publicKey` above — not a new category
+  of data, just delivered on a different response.
+
 ## Fields held locally by this module
 
 None. This module is stateless — it shapes a request, calls the real

@@ -14,6 +14,9 @@ import { ShareFileScreen } from "../features/vault/screens/ShareFileScreen";
 import { OpenSharedFileScreen } from "../features/vault/screens/OpenSharedFileScreen";
 import { AccessScreen } from "../features/permissions/screens/AccessScreen";
 import { ActivityScreen } from "../features/activity/screens/ActivityScreen";
+import { ConversationsListScreen } from "../features/conversations/screens/ConversationsListScreen";
+import { ConversationThreadScreen } from "../features/conversations/screens/ConversationThreadScreen";
+import { StartConversationScreen } from "../features/conversations/screens/StartConversationScreen";
 import type { RootStackParamList } from "./types";
 
 export type { RootStackParamList };
@@ -33,6 +36,9 @@ export function AppNavigator() {
         <Stack.Screen name="OpenSharedFile" component={OpenSharedFileScreen} />
         <Stack.Screen name="Access" component={AccessScreen} />
         <Stack.Screen name="Activity" component={ActivityScreen} />
+        <Stack.Screen name="Conversations" component={ConversationsListScreen} />
+        <Stack.Screen name="ConversationThread" component={ConversationThreadScreen} />
+        <Stack.Screen name="StartConversation" component={StartConversationScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );
